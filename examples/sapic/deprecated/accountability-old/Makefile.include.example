@@ -1,10 +1,10 @@
 
 PROVER=tamarin-prover
-# ALTPROVER=/Users/robert/Library/Haskell/ghc-7.0.4/lib/tamarin-prover-0.4.1.0/bin/tamarin-prover
+# ALTPROVER=/homes/robert/Library/Haskell/ghc-7.0.4/lib/tamarin-prover-0.4.1.0/bin/tamarin-prover
 HEURISTIC=--heuristic=p
 #BOUND=--bound=31
 INTERACTIVEBOUND=--bound=4
-MAUDE=--with-maude=/Users/robert/bin/maudelib/maude.darwin64
+MAUDE=--with-maude=/homes/robert/bin/maudelib/maude.darwin64
 FLAGS=$(MAUDE) $(HEURISTIC) $(BOUND) #+RTS -N -RTS
 INTERACTIVEFLAGS=$(MAUDE) $(HEURISTIC) $(INTERACTIVEBOUND) #+RTS -N -RTS
 

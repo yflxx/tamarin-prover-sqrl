@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 HOSTNAME="ProtoMachine"
-HOST_PATH_1="/Users/robert/lab/teaching/2018-WS-Hands-On-Protocol-Verification/handsonws18/projects"
+HOST_PATH_1="/homes/robert/lab/teaching/2018-WS-Hands-On-Protocol-Verification/handsonws18/projects"
 DOCKER_PATH_1="/workspace"
 # VIRTUAL_ENV="/PATH/TO/LOCAL/VIRTUALENV/"
 

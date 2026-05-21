@@ -49,6 +49,7 @@ library
 
   exposed-modules:
     Export
+    SquirrelExport
 
   other-modules:
     RuleTranslation

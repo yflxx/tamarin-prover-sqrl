@@ -19,6 +19,7 @@ data ModuleType
     ModuleSpthyTyped
   | ModuleSpthy
   | ModuleMsr
+  | ModuleSquirrel
   | ModuleProVerifEquivalence
   | ModuleProVerif
   | ModuleDeepSec
@@ -28,6 +29,7 @@ instance Show ModuleType where
   show ModuleSpthyTyped = "spthytyped"
   show ModuleSpthy = "spthy"
   show ModuleMsr = "msr"
+  show ModuleSquirrel = "squirrel"
   show ModuleProVerifEquivalence = "proverifequiv"
   show ModuleProVerif = "proverif"
   show ModuleDeepSec = "deepsec"
@@ -36,6 +38,7 @@ description :: ModuleType -> String
 description ModuleSpthy = "spthy (including Sapic Processes)"
 description ModuleSpthyTyped = "spthy with explicit types inferred"
 description ModuleMsr = "pure msrs (with Sapic translation)"
+description ModuleSquirrel = "Squirrel export for SAPIC processes"
 description ModuleProVerifEquivalence = "ProVerif export for the equivalence lemmas"
 description ModuleProVerif = "ProVerif export for the reachability lemmas"
 description ModuleDeepSec = "DeepSec export for the equivalences lemmas"

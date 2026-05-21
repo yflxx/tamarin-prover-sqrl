@@ -52,6 +52,7 @@ import Items.OptionItem (Option (..))
 import Main.Console
 import Safe
 import Sapic qualified
+import SquirrelExport qualified
 import System.Console.CmdArgs.Explicit
 import System.Timeout (timeout)
 import Text.Parsec (ParseError)
@@ -439,6 +440,7 @@ processOpenTheory thyOpts = case thyOpts.outputModule of
   Just ModuleProVerifEquivalence -> Sapic.typeTheory -- Type theory here to catch errors.
   Just ModuleProVerif -> Sapic.typeTheory -- Type theory here to catch errors.
   Just ModuleDeepSec -> Sapic.typeTheory
+  Just ModuleSquirrel -> Sapic.typeTheory
   where
     lemmas = lemmaSelector thyOpts
 
@@ -689,6 +691,7 @@ prettyOpenTheoryByModule thyOpts = case  thyOpts.outputModule of
   Just ModuleProVerifEquivalence -> Export.prettyProVerifEquivTheory <=< Sapic.typeTheoryEnv
   Just ModuleProVerif -> Export.prettyProVerifTheory ModuleProVerif noReuse noRestrictions lemmas <=< Sapic.typeTheoryEnv
   Just ModuleDeepSec -> Export.prettyDeepSecTheory replicationBound
+  Just ModuleSquirrel -> SquirrelExport.prettySquirrelTheory <=< Sapic.typeTheoryEnv
   where
     lemmas = lemmaSelector thyOpts
     noReuse = thyOpts.noReuse
