@@ -20,6 +20,7 @@ import Numeric (showHex)
 import RuleTranslation (ppFunSym)
 import Sapic.Annotation
 import Sapic.Report
+import Sapic.SecretChannels
 import Sapic.States
 import Sapic.Typing
 import System.IO.Unsafe
@@ -38,6 +39,8 @@ data SquirrelContext = SquirrelContext
     messageBoundIndexVars :: S.Set SapicLVar
   }
 
+-- Rendered fragments carry the declarations they require.  The top-level
+-- printer merges this metadata after rendering all process bodies.
 data SquirrelRender = SquirrelRender
   { squirrelDoc :: Doc,
     squirrelWarnings :: [String],
@@ -92,6 +95,8 @@ data SquirrelBuiltinStmt = SquirrelBuiltinStmt
     builtinStmtDoc :: Doc
   }
 
+-- Squirrel does not match Tamarin's builtin theory exactly.  Best-effort
+-- translations are emitted with warnings so callers can inspect the lossiness.
 data BuiltinTranslation = BuiltinTranslation
   { builtinTranslationStmts :: [SquirrelBuiltinStmt],
     builtinTranslationNames :: S.Set String,
@@ -157,9 +162,12 @@ builtins "hashing" =
     [ builtinStmt "h-decl" (text "hash hash_fn.") ]
     ["hash_fn"]
 builtins "asymmetric-encryption" =
-  accurateBuiltin
-    [ builtinStmt "aenc-decl" (text "aenc asym_enc, asym_dec, asym_pk.") ]
-    ["asym_enc", "asym_dec", "asym_pk"]
+  bestEffortBuiltin
+    [ builtinStmt "aenc-decl" (text "aenc asym_enc, asym_dec, asym_pk."),
+      builtinStmt "aenc-rnd-decl" (text "name arnd : message.")
+    ]
+    ["asym_enc", "asym_dec", "asym_pk", "arnd"]
+    "Asymmetric encryption uses one fixed Squirrel name for implicit Tamarin randomness."
 builtins "signing" =
   accurateBuiltin
     [ builtinStmt "signature-decl" (text "signature sig_sign, sig_verify, sig_pk.") ]
@@ -175,9 +183,12 @@ builtins "revealing-signing" =
     ]
     ["sig_sign", "sig_verify", "sig_pk", "revealSign", "revealVerify", "getMessage"]
 builtins "symmetric-encryption" =
-  accurateBuiltin
-    [ builtinStmt "senc-decl" (text "senc sym_enc, sym_dec.") ]
-    ["sym_enc", "sym_dec"]
+  bestEffortBuiltin
+    [ builtinStmt "senc-decl" (text "senc sym_enc, sym_dec."),
+      builtinStmt "senc-rnd-decl" (text "name srnd : message.")
+    ]
+    ["sym_enc", "sym_dec", "srnd"]
+    "Symmetric encryption uses one fixed Squirrel name for implicit Tamarin randomness."
 builtins "multiset" =
   unsupportedBuiltin
     "Multiset is not supported in Squirrel. If you want to model natural numbers, you can use the dedicated Tamarin builtin."
@@ -257,6 +268,8 @@ prettySquirrelTheory (thy, _) =
           rendered = ppSquirrel tc p
           procDefRendered = map (ppSquirrelProcessDef tc thy) (theoryProcessDefs thy)
           renderedAll = foldl mergeSquirrelRenders rendered (map snd procDefRendered)
+          -- Declarations are inferred from all rendered processes, then filtered
+          -- against Squirrel/Core names and builtin declarations below.
           (builtinDecls, builtinNames, builtinWarnings) = collectBuiltinDecls (theoryBuiltins thy)
           warningDocs =
             map
@@ -336,8 +349,8 @@ ppSquirrelVarType _ = "message"
 ppSquirrelLeafProcess :: SquirrelContext -> LProcess (ProcessAnnotation LVar) -> Maybe SquirrelRender
 ppSquirrelLeafProcess _ (ProcessAction (Event _) _ (ProcessAction (ChOut _ _) _ (ProcessNull _))) =
   translationFail "The input file cannot be exported to Squirrel: SAPIC events are not supported in Squirrel process bodies."
-ppSquirrelLeafProcess tc (ProcessAction (ChOut ch msg) _ (ProcessNull _)) =
-  let chRender = ppSquirrelChan ch
+ppSquirrelLeafProcess tc (ProcessAction (ChOut ch msg) an (ProcessNull _)) =
+  let chRender = ppSquirrelChan an ch
       rendered = ppSquirrelTerm tc msg
    in Just $
         renderFromParts
@@ -348,7 +361,9 @@ ppSquirrelLeafProcess _ _ = Nothing
 makeAnnotations :: OpenTheory -> PlainProcess -> LProcess (ProcessAnnotation LVar)
 makeAnnotations thy p = res
   where
-    p' = report $ toAnProcess p
+    -- Run report rewriting before pure-state annotation so generated state
+    -- channels see the final terms, and preserve secret-channel annotations.
+    p' = report $ annotateSecretChannels $ toAnProcess p
     res = annotatePureStates p'
     report pr =
       if isNothing (List.find (== "locations-report") (theoryBuiltins thy))
@@ -658,16 +673,19 @@ data SquirrelMutexRef = SquirrelMutexRef
   deriving (Eq)
 
 ppSquirrelTerm :: SquirrelContext -> SapicTerm -> SquirrelRender
-ppSquirrelTerm tc = ppSquirrelTermWith tc (const True)
+ppSquirrelTerm tc = ppSquirrelTermWith tc (const True) False
 
 ppSquirrelFormulaTerm :: SquirrelContext -> S.Set LVar -> SapicTerm -> SquirrelRender
-ppSquirrelFormulaTerm tc boundVars = ppSquirrelTermWith tc renderPublicVarAsConstant
+ppSquirrelFormulaTerm tc boundVars = ppSquirrelTermWith tc renderPublicVarAsConstant True
   where
     renderPublicVarAsConstant (SapicLVar lvar _) =
       lvarSort lvar == LSortPub && lvar `S.notMember` boundVars
 
-ppSquirrelTermWith :: SquirrelContext -> (SapicLVar -> Bool) -> SapicTerm -> SquirrelRender
-ppSquirrelTermWith tc renderPublicVarAsConstant t =
+-- Formula rendering turns Tamarin's true/false constants into Squirrel bools.
+-- Process-term rendering keeps them as ordinary message constants unless a
+-- surrounding boolean context explicitly handles them.
+ppSquirrelTermWith :: SquirrelContext -> (SapicLVar -> Bool) -> Bool -> SapicTerm -> SquirrelRender
+ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
   SquirrelRender
     { squirrelDoc = doc,
       squirrelWarnings = [],
@@ -720,8 +738,17 @@ ppSquirrelTermWith tc renderPublicVarAsConstant t =
       FApp (AC op) ts ->
         let f = sanitizeSquirrelSymbol 'a' ("ac_" ++ show op)
          in goACNested f ts
-      FApp (NoEq (f, _)) [] | squirrelBoolNoEqFunName f == Just True -> (text "true", M.empty, S.empty)
-      FApp (NoEq (f, _)) [] | squirrelBoolNoEqFunName f == Just False -> (text "false", M.empty, S.empty)
+      FApp (NoEq (f, (_, Private, _))) ts
+        -- locations-report declares rep as a private Tamarin constructor, but
+        -- the Squirrel export models it as an explicit abstract function.
+        | ppFunSym f == "rep" && hasLocationsReportBuiltin tc ->
+            ppFunLike "rep" ts
+        | otherwise ->
+            translationFail $
+              "The input file cannot be exported to Squirrel: private function symbols are not supported in Squirrel export: "
+                ++ BC.unpack f
+      FApp (NoEq (f, _)) [] | renderBoolConstants && squirrelBoolNoEqFunName f == Just True -> (text "true", M.empty, S.empty)
+      FApp (NoEq (f, _)) [] | renderBoolConstants && squirrelBoolNoEqFunName f == Just False -> (text "false", M.empty, S.empty)
       FApp (NoEq (f, _)) [] | ppFunSym f == "zero" && hasXorBuiltin tc -> (text "zero", M.empty, S.singleton "zero")
       FApp (NoEq s) [] | s == natOneSym -> (text "one", M.empty, S.singleton "one")
       FApp (NoEq (f, _)) [t1] | ppFunSym f == "h" && hasHashingBuiltin tc ->
@@ -826,6 +853,8 @@ ppSquirrelRefDoc :: String -> [SquirrelRender] -> Doc
 ppSquirrelRefDoc n [] = text n
 ppSquirrelRefDoc n args = text n <> parens (fsep (punctuate comma (map squirrelDoc args)))
 
+-- SAPIC state and mutex cells are encoded as Squirrel indexed symbols.  Only
+-- terms with a stable structural shape can become such references.
 squirrelStateRef :: SquirrelContext -> SapicTerm -> Maybe SquirrelCellRef
 squirrelStateRef tc t = do
   (tag, args) <- squirrelStructuredArgs tc t
@@ -902,8 +931,10 @@ compareStructuredParts tc left right = compare (structuredPartKey tc left) (stru
 structuredPartKey :: SquirrelContext -> (String, [SapicTerm]) -> (String, [String])
 structuredPartKey tc (tag, args) = (tag, map (render . squirrelDoc . ppSquirrelTerm tc) args)
 
-ppSquirrelActionWithInputBinder :: SquirrelContext -> Maybe Doc -> LSapicAction -> SquirrelRender
-ppSquirrelActionWithInputBinder tc inputBinder = \case
+-- Squirrel has a single public channel in this exporter.  Explicit SAPIC
+-- channels are collapsed to it unless the channel was proven always-secret.
+ppSquirrelActionWithInputBinder :: SquirrelContext -> Maybe Doc -> ProcessAnnotation LVar -> LSapicAction -> SquirrelRender
+ppSquirrelActionWithInputBinder tc inputBinder an = \case
   Rep ->
     SquirrelRender
       { squirrelDoc = text "out(pub_chan, srep_drop)",
@@ -917,13 +948,13 @@ ppSquirrelActionWithInputBinder tc inputBinder = \case
     | isSyntheticStateChannelVar v -> emptySquirrelRender (text "null")
     | otherwise -> emptySquirrelRender (text "new " <> ppUnTypeVar v)
   ChIn ch msg mvars ->
-    let chRender = ppSquirrelChan ch
+    let chRender = ppSquirrelChan an ch
         binder = fromMaybe (ppSquirrelInputBinder (text "sq_in") msg mvars) inputBinder
      in chRender
           { squirrelDoc = text "in(" <> squirrelDoc chRender <> text ", " <> binder <> text ")"
           }
   ChOut ch msg ->
-    let chRender = ppSquirrelChan ch
+    let chRender = ppSquirrelChan an ch
         tmsg = ppSquirrelTerm tc msg
      in renderFromParts
           (text "out(" <> squirrelDoc chRender <> text ", " <> squirrelDoc tmsg <> text ")")
@@ -975,13 +1006,17 @@ mergeSquirrelRenders :: SquirrelRender -> SquirrelRender -> SquirrelRender
 mergeSquirrelRenders l r =
   (mergeSquirrelMetadata [l, r]) {squirrelDoc = squirrelDoc l}
 
-ppSquirrelChan :: Maybe SapicTerm -> SquirrelRender
-ppSquirrelChan ch =
+ppSquirrelChan :: ProcessAnnotation LVar -> Maybe SapicTerm -> SquirrelRender
+ppSquirrelChan an ch =
   case ch of
-    Just _ ->
-      withWarnings
-        ["Explicit SAPIC channels are mapped to pub_chan in Squirrel export."]
-        (emptySquirrelRender (text "pub_chan"))
+    Just _
+      | isJust an.secretChannel ->
+          translationFail
+            "The input file cannot be exported to Squirrel: always-secret SAPIC channels are not supported."
+      | otherwise ->
+          withWarnings
+            ["Explicit SAPIC channels are mapped to pub_chan in Squirrel export."]
+            (emptySquirrelRender (text "pub_chan"))
     Nothing ->
       withWarnings
         ["Implicit SAPIC channel mapped to pub_chan in Squirrel export."]
@@ -1009,6 +1044,9 @@ ppSquirrelPatternConstraints tc mvars base t =
   let (_, projections, guards) = go S.empty base t
    in (projections, guards)
   where
+    -- Pair patterns become projections; repeated or already-bound variables
+    -- become guards.  Other patterns can only guard over variables already in
+    -- scope, because Squirrel cannot bind inside arbitrary message terms here.
     go bound actual term
       | isPair term = case viewTerm term of
           FApp _ [t1, t2] ->
@@ -1111,6 +1149,8 @@ updateContextAfterLookup tc _ = tc
 inputBoundIndexVars :: SapicTerm -> S.Set SapicLVar -> S.Set SapicLVar
 inputBoundIndexVars msg mvars = indexVarsInTerm msg `S.difference` mvars
 
+-- Index variables received as messages are no longer safe to use as Squirrel
+-- state indices.  Track them so later state/mutex references are rejected.
 indexVarsInTerm :: SapicTerm -> S.Set SapicLVar
 indexVarsInTerm tm =
   case viewTerm tm of
@@ -1150,6 +1190,8 @@ ppSquirrelBranchRenders ::
   SquirrelRender ->
   BranchRenders
 ppSquirrelBranchRenders thenTc elseTc thenName elseName heldMutexes pl rl pr rr =
+  -- Squirrel mutex state cannot be path-dependent: both branches must leave
+  -- exactly the locks they inherited.
   if heldAfterThen /= heldMutexes || heldAfterElse /= heldMutexes
     then
       translationFail $
@@ -1194,12 +1236,12 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction Rep _
         | isProcessNull p || docIsNull (squirrelDoc rp) = text "null"
         | otherwise = repDocs (text idxName) (squirrelDoc rp)
    in rp {squirrelDoc = d}
-ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction a _ p) =
+ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction a an p) =
   let inputBinder =
         case a of
           ChIn _ msg mvars -> Just (freshInputBinder msg mvars p)
           _ -> Nothing
-      ra = ppSquirrelActionWithInputBinder tc inputBinder a
+      ra = ppSquirrelActionWithInputBinder tc inputBinder an a
       tcForContinuation = updateContextAfterAction tc a
       heldForContinuation = updateHeldMutexes tc heldMutexes a
       rp = ppSquirrelWithDepthHeld depth tcForContinuation usedRepIndexes heldForContinuation p
@@ -1301,7 +1343,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (CondEq
       hasElse = branchHasElse branches
       rt1 = ppSquirrelTerm tc t1
       rt2 = ppSquirrelTerm tc t2
-      condDoc = ppSquirrelCondEqDoc tc t1 rt1 t2 rt2
+      (condDoc, condRenders) = ppSquirrelCondEq tc t1 rt1 t2 rt2
       d =
         text "if "
           <> condDoc
@@ -1310,7 +1352,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (CondEq
           $$ if hasElse then text "else" $$ wrapBranchDoc (squirrelDoc elseRender) else emptyDoc
    in withWarnings
         (branchWarnings branches)
-        (renderFromParts d [thenRender, rr, rt1, rt2, elseRender])
+        (renderFromParts d (thenRender : rr : elseRender : condRenders))
 
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (Lookup t c) _ pl pr) =
   let tcForThen = updateContextAfterLookup tc c
@@ -1365,6 +1407,8 @@ removeHeldMutex held mtx
   | otherwise =
       translationFail "The input file cannot be exported to Squirrel: process unlocks a mutex that is not held."
 
+-- Conservative lock-flow analysis used to reject processes whose Squirrel
+-- translation would make lock ownership branch-dependent or leak to exit.
 heldDefinitelyAfterProcess :: SquirrelContext -> [SquirrelMutexRef] -> LProcess (ProcessAnnotation LVar) -> [SquirrelMutexRef]
 heldDefinitelyAfterProcess _ held (ProcessNull _) = held
 heldDefinitelyAfterProcess tc held (ProcessAction (ProcessCall _ _) _ p)
@@ -1396,11 +1440,19 @@ heldDefinitelyAfterProcess tc held (ProcessComb (Lookup _ c) _ pl pr) =
   heldDefinitelyAfterProcess (updateContextAfterLookup tc c) held pl
     `List.intersect` heldDefinitelyAfterProcess tc held pr
 
-ppSquirrelCondEqDoc :: SquirrelContext -> SapicTerm -> SquirrelRender -> SapicTerm -> SquirrelRender -> Doc
-ppSquirrelCondEqDoc tc t1 r1 t2 r2
-  | isBoolLiteral True t1 && isBoolLikeTerm tc t2 = squirrelDoc r2
-  | isBoolLikeTerm tc t1 && isBoolLiteral True t2 = squirrelDoc r1
-  | otherwise = squirrelDoc r1 <> text " = " <> squirrelDoc r2
+-- CondEq is overloaded in SAPIC: equality over messages, but often boolean
+-- tests after builtin verification.  Render boolean cases as Squirrel boolean
+-- conditions, while keeping message equality for ordinary terms.
+ppSquirrelCondEq :: SquirrelContext -> SapicTerm -> SquirrelRender -> SapicTerm -> SquirrelRender -> (Doc, [SquirrelRender])
+ppSquirrelCondEq tc t1 r1 t2 r2
+  | Just b1 <- boolLiteralValue t1,
+    Just b2 <- boolLiteralValue t2 =
+      (text (if b1 == b2 then "true" else "false"), [])
+  | isBoolLiteral True t1 && isBoolLikeTerm tc t2 = (squirrelDoc r2, [r2])
+  | isBoolLikeTerm tc t1 && isBoolLiteral True t2 = (squirrelDoc r1, [r1])
+  | isBoolLiteral False t1 && isBoolLikeTerm tc t2 = (operator_ "not" <> opParens (squirrelDoc r2), [r2])
+  | isBoolLikeTerm tc t1 && isBoolLiteral False t2 = (operator_ "not" <> opParens (squirrelDoc r1), [r1])
+  | otherwise = (squirrelDoc r1 <> text " = " <> squirrelDoc r2, [r1, r2])
 
 isBoolLikeTerm :: SquirrelContext -> SapicTerm -> Bool
 isBoolLikeTerm tc tm =
@@ -1416,11 +1468,18 @@ isBoolLikeTerm tc tm =
     _ -> False
 
 isBoolLiteral :: Bool -> SapicTerm -> Bool
-isBoolLiteral expected tm =
+isBoolLiteral expected tm = boolLiteralValue tm == Just expected
+
+boolLiteralValue :: SapicTerm -> Maybe Bool
+boolLiteralValue tm =
   case viewTerm tm of
-    FApp (NoEq (f, _)) [] -> squirrelBoolNoEqFunName f == Just expected
-    Lit (Con c) -> map toLower (show c) == if expected then "true" else "false"
-    _ -> False
+    FApp (NoEq (f, _)) [] -> squirrelBoolNoEqFunName f
+    Lit (Con c) ->
+      case map toLower (show c) of
+        "true" -> Just True
+        "false" -> Just False
+        _ -> Nothing
+    _ -> Nothing
 
 squirrelBoolNoEqFunName :: BC.ByteString -> Maybe Bool
 squirrelBoolNoEqFunName f =
