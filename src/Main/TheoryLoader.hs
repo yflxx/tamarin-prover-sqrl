@@ -691,7 +691,7 @@ prettyOpenTheoryByModule thyOpts = case  thyOpts.outputModule of
   Just ModuleProVerifEquivalence -> Export.prettyProVerifEquivTheory <=< Sapic.typeTheoryEnv
   Just ModuleProVerif -> Export.prettyProVerifTheory ModuleProVerif noReuse noRestrictions lemmas <=< Sapic.typeTheoryEnv
   Just ModuleDeepSec -> Export.prettyDeepSecTheory replicationBound
-  Just ModuleSquirrel -> SquirrelExport.prettySquirrelTheory <=< Sapic.typeTheoryEnv
+  Just ModuleSquirrel -> SquirrelExport.prettySquirrelTheory noReuse lemmas <=< Sapic.typeTheoryEnv
   where
     lemmas = lemmaSelector thyOpts
     noReuse = thyOpts.noReuse

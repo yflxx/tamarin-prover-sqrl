@@ -3,6 +3,8 @@
 
 {-# HLINT ignore "Use lambda-case" #-}
 
+-- Translation from Sapic processes to Squirrel
+
 module SquirrelExport
   ( prettySquirrelTheory,
   )
@@ -10,6 +12,7 @@ where
 
 import Control.Monad.Fresh
 import Control.Monad.Trans.PreciseFresh qualified as Precise
+import Control.Exception (IOException, evaluate, try)
 import Data.ByteString.Char8 qualified as BC
 import Data.Char
 import Data.List as List
@@ -24,9 +27,11 @@ import Sapic.SecretChannels
 import Sapic.States
 import Sapic.Typing
 import System.IO.Unsafe
-import Term.SubtermRule (CtxtStRule)
+import System.IO.Error (ioeGetErrorString)
+import Term.SubtermRule (CtxtStRule (..), StRhs (..))
 import Text.PrettyPrint.Class
 import Theory
+import Theory.Module (ModuleType (..))
 import Theory.Sapic
 import Theory.Text.Pretty
 
@@ -36,7 +41,10 @@ translationFail s = unsafePerformIO (fail s)
 data SquirrelContext = SquirrelContext
   { predicates :: [Predicate],
     squirrelTheoryBuiltins :: S.Set String,
-    messageBoundIndexVars :: S.Set SapicLVar
+    squirrelEventArities :: M.Map String Int,
+    squirrelProcessArities :: M.Map String Int,
+    messageBoundIndexVars :: S.Set SapicLVar,
+    squirrelVarNames :: M.Map LVar String
   }
 
 -- Rendered fragments carry the declarations they require.  The top-level
@@ -46,9 +54,19 @@ data SquirrelRender = SquirrelRender
     squirrelWarnings :: [String],
     squirrelFunDecls :: M.Map String Int,
     squirrelConstDecls :: S.Set String,
+    squirrelNameDecls :: S.Set String,
     squirrelStateDecls :: M.Map String Int,
-    squirrelMutexDecls :: M.Map String Int
+    squirrelMutexDecls :: M.Map String Int,
+    squirrelNeedsWeakSecrecy :: Bool,
+    squirrelGlobalNoParens :: Bool,
+    squirrelSkippedEquations :: S.Set Int,
+    squirrelSkippedLemmas :: S.Set String
   }
+
+data SquirrelFormulaStyle
+  = SquirrelLocalFormula
+  | SquirrelGlobalFormula
+  deriving (Eq)
 
 emptySquirrelRender :: Doc -> SquirrelRender
 emptySquirrelRender d =
@@ -57,8 +75,13 @@ emptySquirrelRender d =
       squirrelWarnings = [],
       squirrelFunDecls = M.empty,
       squirrelConstDecls = S.empty,
+      squirrelNameDecls = S.empty,
       squirrelStateDecls = M.empty,
-      squirrelMutexDecls = M.empty
+      squirrelMutexDecls = M.empty,
+      squirrelNeedsWeakSecrecy = False,
+      squirrelGlobalNoParens = False,
+      squirrelSkippedEquations = S.empty,
+      squirrelSkippedLemmas = S.empty
     }
 
 mergeMaxMaps :: Ord k => [M.Map k Int] -> M.Map k Int
@@ -71,8 +94,13 @@ mergeSquirrelMetadata renders =
       squirrelWarnings = concatMap squirrelWarnings renders,
       squirrelFunDecls = mergeMaxMaps (map squirrelFunDecls renders),
       squirrelConstDecls = S.unions (map squirrelConstDecls renders),
+      squirrelNameDecls = S.unions (map squirrelNameDecls renders),
       squirrelStateDecls = mergeMaxMaps (map squirrelStateDecls renders),
-      squirrelMutexDecls = mergeMaxMaps (map squirrelMutexDecls renders)
+      squirrelMutexDecls = mergeMaxMaps (map squirrelMutexDecls renders),
+      squirrelNeedsWeakSecrecy = or (map squirrelNeedsWeakSecrecy renders),
+      squirrelGlobalNoParens = False,
+      squirrelSkippedEquations = S.unions (map squirrelSkippedEquations renders),
+      squirrelSkippedLemmas = S.unions (map squirrelSkippedLemmas renders)
     }
 
 renderFromParts :: Doc -> [SquirrelRender] -> SquirrelRender
@@ -81,6 +109,26 @@ renderFromParts d renders = (mergeSquirrelMetadata renders) {squirrelDoc = d}
 withWarnings :: [String] -> SquirrelRender -> SquirrelRender
 withWarnings warnings rendered =
   rendered {squirrelWarnings = warnings ++ squirrelWarnings rendered}
+
+withFunDecl :: String -> Int -> SquirrelRender -> SquirrelRender
+withFunDecl name arity rendered =
+  rendered {squirrelFunDecls = M.insertWith max name arity (squirrelFunDecls rendered)}
+
+withWeakSecrecy :: SquirrelRender -> SquirrelRender
+withWeakSecrecy rendered =
+  rendered {squirrelNeedsWeakSecrecy = True}
+
+withGlobalNoParens :: SquirrelRender -> SquirrelRender
+withGlobalNoParens rendered =
+  rendered {squirrelGlobalNoParens = True}
+
+withSkippedEquation :: Int -> SquirrelRender -> SquirrelRender
+withSkippedEquation index rendered =
+  rendered {squirrelSkippedEquations = S.insert index (squirrelSkippedEquations rendered)}
+
+withSkippedLemma :: String -> SquirrelRender -> SquirrelRender
+withSkippedLemma name rendered =
+  rendered {squirrelSkippedLemmas = S.insert name (squirrelSkippedLemmas rendered)}
 
 withStateDecl :: String -> Int -> SquirrelRender -> SquirrelRender
 withStateDecl name arity rendered =
@@ -243,64 +291,81 @@ supportedBuiltinSig "revealing-signing" = Just revealSignatureMaudeSig
 supportedBuiltinSig "symmetric-encryption" = Just symEncMaudeSig
 supportedBuiltinSig _ = Nothing
 
-rejectUnsupportedTheoryRules :: OpenTheory -> ()
-rejectUnsupportedTheoryRules thy =
-  if S.null (unsupportedTheoryRules thy)
-    then ()
-    else
-      translationFail
-        "The input file cannot be exported to Squirrel: user-defined equations are not supported."
-
-prettySquirrelTheory :: (OpenTheory, TypingEnvironment) -> IO Doc
-prettySquirrelTheory (thy, _) =
+prettySquirrelTheory ::
+  Bool ->
+  (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
+  (OpenTheory, TypingEnvironment) ->
+  IO Doc
+prettySquirrelTheory noReuse lemSel (thy, typEnv) =
   case theoryProcesses thy of
     [] -> pure $ text "(* No SAPIC process found. *)"
-    [pr] ->
+    [pr] -> do
       let p = makeAnnotations thy pr
-          _noUnsupportedTheoryRules = rejectUnsupportedTheoryRules thy
+          processDefs = theoryProcessDefs thy
+          eventArities =
+            mergeEventArities $
+              collectProcessEvents p
+                : map (\pdef -> collectProcessEvents (makeAnnotations thy pdef._pBody)) processDefs
+          processArities = squirrelProcessAritiesFromDefs processDefs
           _hasStates = hasBoundUnboundStates p
           tc =
             SquirrelContext
               { predicates = theoryPredicates thy,
                 squirrelTheoryBuiltins = S.fromList (theoryBuiltins thy),
-                messageBoundIndexVars = S.empty
+                squirrelEventArities = eventArities,
+                squirrelProcessArities = processArities,
+                messageBoundIndexVars = S.empty,
+                squirrelVarNames = M.empty
               }
-          rendered = ppSquirrel tc p
-          procDefRendered = map (ppSquirrelProcessDef tc thy) (theoryProcessDefs thy)
-          renderedAll = foldl mergeSquirrelRenders rendered (map snd procDefRendered)
+          processTc = withSquirrelProcessVarNames tc [] p
+          rendered = ppSquirrel processTc p
+          procDefRendered = map (ppSquirrelProcessDef tc thy) processDefs
+      equationRendered <- mapM (uncurry (ppSquirrelEquationOrWarning tc)) (zip [(1 :: Int) ..] (squirrelEquationRules thy))
+      lemmaRendered <- mapM (ppSquirrelLemmaOrWarning tc typEnv) (squirrelLemmas noReuse lemSel thy)
+      let
+          renderedAll = foldl mergeSquirrelRenders rendered (map snd procDefRendered ++ equationRendered ++ lemmaRendered)
           -- Declarations are inferred from all rendered processes, then filtered
           -- against Squirrel/Core names and builtin declarations below.
           (builtinDecls, builtinNames, builtinWarnings) = collectBuiltinDecls (theoryBuiltins thy)
           warningDocs =
             map
               (\w -> text "(* WARNING: " <> text w <> text " *)")
-              (List.nub (builtinWarnings ++ squirrelWarnings renderedAll))
-          funDecls = map ppSquirrelFunDecl (M.toList (M.filterWithKey (\k _ -> not (isSquirrelBuiltinSymbol k) && not (k `S.member` squirrelConstDecls renderedAll) && not (k `S.member` builtinNames)) (squirrelFunDecls renderedAll)))
+              (List.nub (skippedContentSummaryWarnings renderedAll ++ builtinWarnings ++ squirrelWarnings renderedAll))
+          eventPayloadNames = S.fromList (map squirrelEventPayloadNameFromName (M.keys eventArities))
+          eventPayloadDecls = map ppSquirrelEventPayloadDecl (M.toList eventArities)
+          funDecls = map ppSquirrelFunDecl (M.toList (M.filterWithKey (\k _ -> not (isSquirrelBuiltinSymbol k) && not (k `S.member` eventPayloadNames) && not (k `S.member` squirrelConstDecls renderedAll) && not (k `S.member` builtinNames)) (squirrelFunDecls renderedAll)))
           constDecls = map ppSquirrelConstDecl (S.toList (S.filter (\k -> not (isSquirrelBuiltinSymbol k) && not (k `S.member` builtinNames)) (S.delete "pub_chan" (squirrelConstDecls renderedAll))))
+          nameDecls = map ppSquirrelNameDecl (S.toList (S.filter (not . isSquirrelBuiltinSymbol) (squirrelNameDecls renderedAll)))
           stateInitDecls = map ppSquirrelStateInitDecl (M.toList (squirrelStateDecls renderedAll))
           stateDecls = map ppSquirrelStateDecl (M.toList (squirrelStateDecls renderedAll))
           statePresenceDecls = map ppSquirrelStatePresenceDecl (M.toList (squirrelStateDecls renderedAll))
           mutexDecls = map ppSquirrelMutexDecl (M.toList (squirrelMutexDecls renderedAll))
           procDefDocs = map fst procDefRendered
+          equationDocs = map squirrelDoc equationRendered
+          lemmaDocs = map squirrelDoc lemmaRendered
           comments = [text "(*" $$ text bd $$ text "*)" | (_, bd) <- theoryFormalComments thy]
           preludeDocs =
-            [ text "set postQuantumEquivs = true.",
-              text "include Core.",
-              text "channel pub_chan."
+            [ text "include Core."
             ]
+              ++ [text "include WeakSecrecy." | squirrelNeedsWeakSecrecy renderedAll]
+              ++ [text "channel pub_chan."]
           declDocs =
             builtinDecls
               ++ constDecls
+              ++ eventPayloadDecls
+              ++ nameDecls
               ++ funDecls
+              ++ equationDocs
               ++ stateInitDecls
               ++ stateDecls
               ++ statePresenceDecls
               ++ mutexDecls
           mainProcessDocs =
+            -- The anonymous SAPIC `process:` block is the executable system in
+            -- Squirrel. Named SAPIC process definitions above remain callable
+            -- processes; the top-level process is emitted directly as a system.
             [ text "",
-              text "process main =",
-              nest 2 (squirrelDoc rendered) <> text ".",
-              text "system main."
+              text "system" <-> squirrelDoc rendered <> text "."
             ]
           theoryDocs =
             warningDocs
@@ -309,46 +374,181 @@ prettySquirrelTheory (thy, _) =
               ++ [text ""]
               ++ procDefDocs
               ++ mainProcessDocs
+              ++ lemmaDocs
               ++ comments
-       in _noUnsupportedTheoryRules `seq` pure (vcat theoryDocs)
+      pure (vcat theoryDocs)
     _ ->
       translationFail
         "The input file cannot be exported to Squirrel: multiple SAPIC processes were defined; Squirrel export currently supports exactly one top-level process."
+
+mergeEventArities :: [M.Map String Int] -> M.Map String Int
+mergeEventArities =
+  M.unionsWith
+    ( \l r ->
+        if l == r
+          then l
+          else translationFail "The input file cannot be exported to Squirrel: SAPIC events with the same name and different arities are not supported."
+    )
+
+collectProcessEvents :: LProcess ann -> M.Map String Int
+collectProcessEvents (ProcessNull _) = M.empty
+collectProcessEvents (ProcessAction (Event (Fact tag _ ts)) _ p) =
+  M.insertWith
+    ( \l r ->
+        if l == r
+          then l
+          else translationFail "The input file cannot be exported to Squirrel: SAPIC events with the same name and different arities are not supported."
+    )
+    (factTagName tag)
+    (length ts)
+    (collectProcessEvents p)
+collectProcessEvents (ProcessAction _ _ p) = collectProcessEvents p
+collectProcessEvents (ProcessComb _ _ pl pr) =
+  mergeEventArities [collectProcessEvents pl, collectProcessEvents pr]
+
+squirrelEquationRules :: OpenTheory -> [CtxtStRule]
+squirrelEquationRules = S.toList . unsupportedTheoryRules
+
+squirrelLemmas ::
+  Bool ->
+  (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
+  OpenTheory ->
+  [ProtoLemma LNFormula ProofSkeleton]
+squirrelLemmas noReuse lemSel thy = filter isApplicableLemma (theoryLemmas thy)
+  where
+    isApplicableLemma lem =
+      lemSel lem
+        && not (noReuse && (ReuseLemma `elem` lem._lAttributes || SourceLemma `elem` lem._lAttributes))
+        && moduleCondition lem
+
+    moduleCondition lem =
+      let modules = concat [ls | LemmaModule ls <- lem._lAttributes]
+       in null modules || ModuleSquirrel `elem` modules
+
+squirrelProcessAritiesFromDefs :: [ProcessDef] -> M.Map String Int
+squirrelProcessAritiesFromDefs =
+  M.fromList . map (\pdef -> (pdef._pName, length (fromMaybe [] pdef._pVars)))
+
+skippedContentSummaryWarnings :: SquirrelRender -> [String]
+skippedContentSummaryWarnings rendered =
+  [ "Skipped "
+      ++ show equationCount
+      ++ " user-defined "
+      ++ plural equationCount "equation"
+      ++ " during Squirrel export; see per-equation warnings for details."
+    | equationCount > 0
+  ]
+    ++ [ "Skipped "
+           ++ show lemmaCount
+           ++ " selected Tamarin "
+           ++ plural lemmaCount "lemma"
+           ++ " during Squirrel export; see per-lemma warnings for details."
+         | lemmaCount > 0
+       ]
+  where
+    equationCount = S.size (squirrelSkippedEquations rendered)
+    lemmaCount = S.size (squirrelSkippedLemmas rendered)
+
+plural :: Int -> String -> String
+plural 1 word = word
+plural _ word = word ++ "s"
 
 ppSquirrelProcessDef :: SquirrelContext -> OpenTheory -> ProcessDef -> (Doc, SquirrelRender)
 ppSquirrelProcessDef tc thy pdef =
   let body = makeAnnotations thy (pdef._pBody)
       vars = fromMaybe [] (pdef._pVars)
-      params = if null vars then emptyDoc else parens (fsep (punctuate comma (map ppSquirrelProcParam vars)))
+      procTc = withSquirrelProcessVarNames tc vars body
+      params = if null vars then emptyDoc else parens (fsep (punctuate comma (map (ppSquirrelProcParam procTc) vars)))
       (bodyDoc, bodyRender) =
-        case ppSquirrelLeafProcess tc body of
+        case ppSquirrelLeafProcess procTc body of
           Just rendered -> (squirrelDoc rendered, rendered)
           Nothing ->
-            let r = ppSquirrel tc body
+            let r = ppSquirrel procTc body
              in (squirrelDoc r, r)
       doc = text "process " <> text (sanitizeSquirrelProcessName pdef._pName) <> params <> text " =" $$ nest 2 bodyDoc <> text "."
    in (doc, bodyRender)
 
-ppSquirrelProcParam :: SapicLVar -> Doc
-ppSquirrelProcParam v = ppUnTypeVar v <> text ":" <> text (ppSquirrelVarType v)
+ppSquirrelProcParam :: SquirrelContext -> SapicLVar -> Doc
+ppSquirrelProcParam tc v = ppUnTypeVar tc v <> text ":" <> text (ppSquirrelVarType v)
 
 ppSquirrelProcessCall :: SquirrelContext -> String -> [SapicTerm] -> SquirrelRender
 ppSquirrelProcessCall tc name args =
-  let renderedArgs = map (ppSquirrelTerm tc) args
-      callArgs =
-        case renderedArgs of
-          [] -> emptyDoc
-          _ -> parens (fsep (punctuate comma (map squirrelDoc renderedArgs)))
-   in renderFromParts (text (sanitizeSquirrelProcessName name) <> callArgs) renderedArgs
+  case M.lookup name (squirrelProcessArities tc) of
+    Nothing ->
+      translationFail $
+        "The input file cannot be exported to Squirrel: process call references an unknown process definition: "
+          ++ name
+    Just expected
+      | expected /= length args ->
+          translationFail $
+            "The input file cannot be exported to Squirrel: process call "
+              ++ name
+              ++ " has "
+              ++ show (length args)
+              ++ " "
+              ++ plural (length args) "argument"
+              ++ " but the process definition expects "
+              ++ show expected
+              ++ "."
+      | otherwise ->
+          let renderedArgs = map (ppSquirrelTerm tc) args
+              callArgs =
+                case renderedArgs of
+                  [] -> emptyDoc
+                  _ -> parens (fsep (punctuate comma (map squirrelDoc renderedArgs)))
+           in renderFromParts (text (sanitizeSquirrelProcessName name) <> callArgs) renderedArgs
 
 ppSquirrelVarType :: SapicLVar -> String
 ppSquirrelVarType (SapicLVar _ (Just "index")) = "index"
 ppSquirrelVarType (SapicLVar _ (Just "node")) = "timestamp"
 ppSquirrelVarType _ = "message"
 
+squirrelEventSuffixName :: String -> String
+squirrelEventSuffixName = sanitizeSquirrelSymbol 'e'
+
+squirrelEventSuffix :: FactTag -> String
+squirrelEventSuffix tag = squirrelEventSuffixName (factTagName tag)
+
+squirrelEventLabelName :: FactTag -> String
+squirrelEventLabelName tag = squirrelEventSuffix tag
+
+squirrelEventMacroName :: FactTag -> String
+squirrelEventMacroName tag = "event_payload_" ++ squirrelEventSuffix tag
+
+squirrelEventTagNameFromName :: String -> String
+squirrelEventTagNameFromName eventName = "event_tag_" ++ squirrelEventSuffixName eventName
+
+squirrelEventPayloadNameFromName :: String -> String
+squirrelEventPayloadNameFromName eventName = "event_" ++ squirrelEventSuffixName eventName
+
+squirrelEventPayloadName :: FactTag -> String
+squirrelEventPayloadName tag = squirrelEventPayloadNameFromName (factTagName tag)
+
+ppSquirrelApply :: String -> [Doc] -> Doc
+ppSquirrelApply name [] = text name
+ppSquirrelApply name args = text name <> parens (fsep (punctuate comma args))
+
+ppSquirrelMacroAt :: String -> Doc -> Doc
+ppSquirrelMacroAt name timestamp = text name <> text "@" <> opParens timestamp
+
+ppSquirrelMacroAtWithStyle :: SquirrelFormulaStyle -> String -> Doc -> Doc
+ppSquirrelMacroAtWithStyle SquirrelGlobalFormula name timestamp =
+  text name <> text "@" <> timestamp
+ppSquirrelMacroAtWithStyle SquirrelLocalFormula name timestamp =
+  ppSquirrelMacroAt name timestamp
+
+ppSquirrelEventPayload :: FactTag -> [SquirrelRender] -> SquirrelRender
+ppSquirrelEventPayload tag args =
+  withFunDecl (squirrelEventPayloadName tag) (length args) $
+    renderFromParts
+      (ppSquirrelApply (squirrelEventPayloadName tag) (map squirrelDoc args))
+      args
+
+eventPayloadOutputWarning :: String
+eventPayloadOutputWarning =
+  "SAPIC events are encoded as public payload outputs in the Squirrel export; event arguments are included in transparent tuple payload terms."
+
 ppSquirrelLeafProcess :: SquirrelContext -> LProcess (ProcessAnnotation LVar) -> Maybe SquirrelRender
-ppSquirrelLeafProcess _ (ProcessAction (Event _) _ (ProcessAction (ChOut _ _) _ (ProcessNull _))) =
-  translationFail "The input file cannot be exported to Squirrel: SAPIC events are not supported in Squirrel process bodies."
 ppSquirrelLeafProcess tc (ProcessAction (ChOut ch msg) an (ProcessNull _)) =
   let chRender = ppSquirrelChan an ch
       rendered = ppSquirrelTerm tc msg
@@ -396,6 +596,9 @@ ppSquirrelAnyAxiom name binders body =
 ppSquirrelConstDecl :: String -> Doc
 ppSquirrelConstDecl n = text "abstract " <> text n <> text " : message."
 
+ppSquirrelNameDecl :: String -> Doc
+ppSquirrelNameDecl n = text "name " <> text n <> text " : message."
+
 ppSquirrelFunDecl :: (String, Int) -> Doc
 ppSquirrelFunDecl (n, arity) =
   text "abstract "
@@ -407,6 +610,57 @@ ppSquirrelFunDecl (n, arity) =
           else intercalate " * " (replicate arity "message") ++ " -> message"
       )
     <> text "."
+
+ppSquirrelEventPayloadDecl :: (String, Int) -> Doc
+ppSquirrelEventPayloadDecl (eventName, arity) =
+  tagDecl $$ payloadDecl
+  where
+    tagName = squirrelEventTagNameFromName eventName
+    payloadName = squirrelEventPayloadNameFromName eventName
+    tagDecl = text "abstract " <> text tagName <> text " : message."
+    payloadDecl
+      | arity == 0 =
+          text "op "
+            <> text payloadName
+            <> text " : message = "
+            <> text tagName
+            <> text "."
+      | otherwise =
+          text "op "
+            <> text payloadName
+            <> text " : "
+            <> text (ppSquirrelTypeArrow arity "message")
+            <-> text "="
+            $$ nest
+              2
+              ( text "fun "
+                  <> ppSquirrelEventPayloadBinder arity
+                  <-> text "=>"
+                  $$ nest 2 (ppSquirrelTransparentEventPayload tagName arity <> text ".")
+              )
+
+ppSquirrelEventPayloadBinder :: Int -> Doc
+ppSquirrelEventPayloadBinder 1 = text "(x1 : message)"
+ppSquirrelEventPayloadBinder arity =
+  text "(("
+    <> fsep (punctuate comma (ppSquirrelEventPayloadVars arity))
+    <> text ") : "
+    <> text (intercalate " * " (replicate arity "message"))
+    <> text ")"
+
+ppSquirrelTransparentEventPayload :: String -> Int -> Doc
+ppSquirrelTransparentEventPayload tagName arity =
+  case ppSquirrelEventPayloadVars arity of
+    [] -> text tagName
+    vars -> text "<" <> text tagName <> text ", " <> ppSquirrelNestedPair vars <> text ">"
+
+ppSquirrelEventPayloadVars :: Int -> [Doc]
+ppSquirrelEventPayloadVars arity = [text ("x" ++ show i) | i <- [1 .. arity]]
+
+ppSquirrelNestedPair :: [Doc] -> Doc
+ppSquirrelNestedPair [] = text "empty"
+ppSquirrelNestedPair [x] = x
+ppSquirrelNestedPair (x : xs) = text "<" <> x <> text ", " <> ppSquirrelNestedPair xs <> text ">"
 
 ppSquirrelStateInitDecl :: (String, Int) -> Doc
 ppSquirrelStateInitDecl (n, arity) =
@@ -527,11 +781,14 @@ sanitizeSquirrelProcessName n = "proc_" ++ sanitizeSquirrelSymbol 'p' n
 
 encodeSquirrelIdentChar :: Char -> String
 encodeSquirrelIdentChar c
-  | isAscii c && isAlphaNum c = [c]
+  | isSquirrelIdentContinue c = [c]
   | otherwise = "_x" ++ showHex (ord c) "_"
 
 isSquirrelIdentStart :: Char -> Bool
 isSquirrelIdentStart c = isAscii c && isAlpha c
+
+isSquirrelIdentContinue :: Char -> Bool
+isSquirrelIdentContinue c = isAscii c && (isAlphaNum c || c == '_' || c == '\'')
 
 isSquirrelBlockedSymbol :: String -> Bool
 isSquirrelBlockedSymbol n = n `elem` squirrelReservedSymbols || isSquirrelBuiltinSymbol n
@@ -652,11 +909,129 @@ ppLVarName (LVar n _ i) = sanitizeSquirrelSymbol 'a' $ n <> "_" <> show i
 ppLVar :: LVar -> Doc
 ppLVar = text . ppLVarName
 
-ppSapicLVarName :: SapicLVar -> String
-ppSapicLVarName (SapicLVar lvar _) = ppLVarName lvar
+withSquirrelProcessVarNames :: SquirrelContext -> [SapicLVar] -> LProcess ann -> SquirrelContext
+withSquirrelProcessVarNames tc params process =
+  tc
+    { squirrelVarNames =
+        allocateSquirrelVarNames
+          (processReservedNames tc process)
+          (processLVars params process)
+    }
 
-ppUnTypeVar :: SapicLVar -> Doc
-ppUnTypeVar (SapicLVar lvar _) = ppLVar lvar
+processLVars :: [SapicLVar] -> LProcess ann -> S.Set LVar
+processLVars params process =
+  S.map sapicLVar (S.fromList params `S.union` foldMap S.singleton process)
+
+sapicLVar :: SapicLVar -> LVar
+sapicLVar (SapicLVar lvar _) = lvar
+
+allocateSquirrelVarNames :: S.Set String -> S.Set LVar -> M.Map LVar String
+allocateSquirrelVarNames reservedNames vars = fst (List.foldl' allocate (M.empty, reservedNames) ordered)
+  where
+    ordered = List.sortOn lvarOrderKey (S.toList vars)
+
+    allocate (env, used) lvar =
+      let name = freshReadableName (sanitizeSquirrelSymbol 'a' (readableLVarBase lvar)) used
+       in (M.insert lvar name env, S.insert name used)
+
+lvarOrderKey :: LVar -> (String, String, Integer)
+lvarOrderKey lvar = (readableLVarBase lvar, lvarName lvar, lvarIdx lvar)
+
+readableLVarBase :: LVar -> String
+readableLVarBase (LVar name _ _) =
+  case stripLocationPrefix name of
+    Just readable -> map toLower readable
+    Nothing -> name
+
+stripLocationPrefix :: String -> Maybe String
+stripLocationPrefix name =
+  case span isDigit name of
+    ([], _) -> Nothing
+    (_, '_' : readable) | not (null readable) -> Just readable
+    _ -> Nothing
+
+freshReadableName :: String -> S.Set String -> String
+freshReadableName base used =
+  head
+    [ candidate
+      | i <- [0 :: Int ..],
+        let candidate = suffix i,
+        candidate `S.notMember` used,
+        not (isSquirrelBlockedSymbol candidate)
+    ]
+  where
+    suffix 0 = base
+    suffix i = base ++ "_" ++ show i
+
+ppLVarNameWith :: SquirrelContext -> LVar -> String
+ppLVarNameWith tc lvar = fromMaybe (ppLVarName lvar) (M.lookup lvar (squirrelVarNames tc))
+
+ppLVarWith :: SquirrelContext -> LVar -> Doc
+ppLVarWith tc = text . ppLVarNameWith tc
+
+ppSapicLVarNameWith :: SquirrelContext -> SapicLVar -> String
+ppSapicLVarNameWith tc (SapicLVar lvar _) = ppLVarNameWith tc lvar
+
+ppUnTypeVar :: SquirrelContext -> SapicLVar -> Doc
+ppUnTypeVar tc (SapicLVar lvar _) = ppLVarWith tc lvar
+
+processReservedNames :: SquirrelContext -> LProcess ann -> S.Set String
+processReservedNames tc = \case
+  ProcessNull _ -> S.empty
+  ProcessAction action _ continuation ->
+    actionReservedNames tc action `S.union` processReservedNames tc continuation
+  ProcessComb comb _ left right ->
+    combReservedNames tc comb
+      `S.union` processReservedNames tc left
+      `S.union` processReservedNames tc right
+
+actionReservedNames :: SquirrelContext -> LSapicAction -> S.Set String
+actionReservedNames tc action =
+  termDeclNames tc (actionTerms action)
+    `S.union` eventActionReservedNames action
+
+actionTerms :: LSapicAction -> [SapicTerm]
+actionTerms = \case
+  Rep -> []
+  New _ -> []
+  ChIn _ msg _ -> [msg]
+  ChOut _ msg -> [msg]
+  Event (Fact _ _ args) -> args
+  Insert cell msg -> [cell, msg]
+  Delete cell -> [cell]
+  Lock term -> [term]
+  Unlock term -> [term]
+  ProcessCall _ args -> args
+  MSR {} -> []
+
+eventActionReservedNames :: LSapicAction -> S.Set String
+eventActionReservedNames (Event (Fact tag _ _)) =
+  S.fromList
+    [ squirrelEventLabelName tag,
+      squirrelEventMacroName tag,
+      squirrelEventPayloadName tag,
+      squirrelEventTagNameFromName (factTagName tag)
+    ]
+eventActionReservedNames _ = S.empty
+
+combReservedNames :: SquirrelContext -> ProcessCombinator SapicLVar -> S.Set String
+combReservedNames tc = \case
+  Parallel -> S.empty
+  NDC -> S.empty
+  Let patternTerm valueTerm _ -> termDeclNames tc [patternTerm, valueTerm]
+  Cond _ -> S.empty
+  CondEq left right -> termDeclNames tc [left, right]
+  Lookup stateTerm _ -> termDeclNames tc [stateTerm]
+
+termDeclNames :: SquirrelContext -> [SapicTerm] -> S.Set String
+termDeclNames tc terms =
+  S.unions
+    [ M.keysSet (squirrelFunDecls rendered),
+      squirrelConstDecls rendered,
+      squirrelNameDecls rendered
+    ]
+  where
+    rendered = mergeSquirrelMetadata (map (ppSquirrelTerm tc) terms)
 
 isSyntheticStateChannelVar :: SapicLVar -> Bool
 isSyntheticStateChannelVar (SapicLVar lvar _) = "StateChannel" `List.isPrefixOf` lvarName lvar
@@ -681,6 +1056,10 @@ ppSquirrelFormulaTerm tc boundVars = ppSquirrelTermWith tc renderPublicVarAsCons
     renderPublicVarAsConstant (SapicLVar lvar _) =
       lvarSort lvar == LSortPub && lvar `S.notMember` boundVars
 
+ppSquirrelEquationTerm :: SquirrelContext -> LNTerm -> SquirrelRender
+ppSquirrelEquationTerm tc =
+  ppSquirrelTermWith tc (const False) False . mapLits (fmap (`SapicLVar` Nothing))
+
 -- Formula rendering turns Tamarin's true/false constants into Squirrel bools.
 -- Process-term rendering keeps them as ordinary message constants unless a
 -- surrounding boolean context explicitly handles them.
@@ -691,36 +1070,43 @@ ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
       squirrelWarnings = [],
       squirrelFunDecls = funs,
       squirrelConstDecls = consts,
+      squirrelNameDecls = names,
       squirrelStateDecls = M.empty,
-      squirrelMutexDecls = M.empty
+      squirrelMutexDecls = M.empty,
+      squirrelNeedsWeakSecrecy = False,
+      squirrelGlobalNoParens = False,
+      squirrelSkippedEquations = S.empty,
+      squirrelSkippedLemmas = S.empty
     }
   where
-    (doc, funs, consts) = go t
+    (doc, funs, consts, names) = go t
 
-    partDoc (d, _, _) = d
-    partFuns (_, f, _) = f
-    partConsts (_, _, c) = c
+    partDoc (d, _, _, _) = d
+    partFuns (_, f, _, _) = f
+    partConsts (_, _, c, _) = c
+    partNames (_, _, _, n) = n
     partsConstDecls = S.unions . map partConsts
-    fromParts d parts = (d, mergeMaxMaps (map partFuns parts), partsConstDecls parts)
+    partsNameDecls = S.unions . map partNames
+    fromParts d parts = (d, mergeMaxMaps (map partFuns parts), partsConstDecls parts, partsNameDecls parts)
     fromPartsWithFun d f arity parts =
-      (d, mergeMaxMaps (M.singleton f arity : map partFuns parts), partsConstDecls parts)
-    withPartConst c (d, f, constDecls) = (d, f, S.insert c constDecls)
+      (d, mergeMaxMaps (M.singleton f arity : map partFuns parts), partsConstDecls parts, partsNameDecls parts)
+    withPartConst c (d, f, constDecls, nameDecls) = (d, f, S.insert c constDecls, nameDecls)
 
     go tm = case viewTerm tm of
       Lit (Var svar@(SapicLVar lvar@(LVar _ LSortPub _) _))
         | renderPublicVarAsConstant svar ->
             let c = "s" ++ sanitizeSquirrelSymbol 'a' (lvarName lvar) ++ "_" ++ show (lvarIdx lvar)
-             in (text c, M.empty, S.singleton c)
-      Lit (Var (SapicLVar lvar _)) -> (ppLVar lvar, M.empty, S.empty)
+             in (text c, M.empty, S.singleton c, S.empty)
+      Lit (Var (SapicLVar lvar _)) -> (ppLVarWith tc lvar, M.empty, S.empty, S.empty)
       Lit (Con (Name PubName n)) ->
         let c = ppSquirrelPubName n
-         in (text c, M.empty, S.singleton c)
+         in (text c, M.empty, S.singleton c, S.empty)
       Lit (Con (Name FreshName n)) ->
         let c = sanitizeSquirrelSymbol 'a' (show n)
-         in (text c, M.empty, S.singleton c)
+         in (text c, M.empty, S.empty, S.singleton c)
       Lit (Con c) ->
         let c' = sanitizeSquirrelSymbol 'a' (show c)
-         in (text c', M.empty, S.singleton c')
+         in (text c', M.empty, S.singleton c', S.empty)
       FApp (NoEq s) [t1, t2] | s == diffSym ->
         let r1 = go t1
             r2 = go t2
@@ -747,10 +1133,10 @@ ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
             translationFail $
               "The input file cannot be exported to Squirrel: private function symbols are not supported in Squirrel export: "
                 ++ BC.unpack f
-      FApp (NoEq (f, _)) [] | renderBoolConstants && squirrelBoolNoEqFunName f == Just True -> (text "true", M.empty, S.empty)
-      FApp (NoEq (f, _)) [] | renderBoolConstants && squirrelBoolNoEqFunName f == Just False -> (text "false", M.empty, S.empty)
-      FApp (NoEq (f, _)) [] | ppFunSym f == "zero" && hasXorBuiltin tc -> (text "zero", M.empty, S.singleton "zero")
-      FApp (NoEq s) [] | s == natOneSym -> (text "one", M.empty, S.singleton "one")
+      FApp (NoEq (f, _)) [] | renderBoolConstants && squirrelBoolNoEqFunName f == Just True -> (text "true", M.empty, S.empty, S.empty)
+      FApp (NoEq (f, _)) [] | renderBoolConstants && squirrelBoolNoEqFunName f == Just False -> (text "false", M.empty, S.empty, S.empty)
+      FApp (NoEq (f, _)) [] | ppFunSym f == "zero" && hasXorBuiltin tc -> (text "zero", M.empty, S.singleton "zero", S.empty)
+      FApp (NoEq s) [] | s == natOneSym -> (text "one", M.empty, S.singleton "one", S.empty)
       FApp (NoEq (f, _)) [t1] | ppFunSym f == "h" && hasHashingBuiltin tc ->
         let r1 = go t1
             key = text "hkey"
@@ -794,13 +1180,13 @@ ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
         _ -> go tm
 
     ppFunLike f [] =
-      (text f, M.singleton f 0, S.empty)
+      (text f, M.singleton f 0, S.empty, S.empty)
     ppFunLike f ts =
       let rendered = map go ts
           docs = map partDoc rendered
        in fromPartsWithFun (text f <> text "(" <> fsep (punctuate comma docs) <> text ")") f (length ts) rendered
 
-    goACNested _ [] = (text "empty", M.empty, S.singleton "empty")
+    goACNested _ [] = (text "empty", M.empty, S.singleton "empty", S.empty)
     goACNested _ [t1] = go t1
     goACNested f [t1, t2] = ppFunLike f [t1, t2]
     goACNested f (t1 : ts) =
@@ -808,7 +1194,7 @@ ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
           rest = goACNested f ts
        in fromPartsWithFun (text f <> text "(" <> partDoc r1 <> text ", " <> partDoc rest <> text ")") f 2 [r1, rest]
 
-    goXor [] = (text "zero", M.empty, S.singleton "zero")
+    goXor [] = (text "zero", M.empty, S.singleton "zero", S.empty)
     goXor [t1] = go t1
     goXor [t1, t2] =
       let r1 = go t1
@@ -933,6 +1319,29 @@ structuredPartKey tc (tag, args) = (tag, map (render . squirrelDoc . ppSquirrelT
 
 -- Squirrel has a single public channel in this exporter.  Explicit SAPIC
 -- channels are collapsed to it unless the channel was proven always-secret.
+ppSquirrelEventAction :: SquirrelContext -> SapicNFact SapicLVar -> Doc -> SquirrelRender
+ppSquirrelEventAction tc (Fact tag _ ts) continuationDoc
+  | factTagArity tag /= length ts =
+      translationFail $ "MALFORMED event fact " ++ show tag
+  | otherwise =
+      withWarnings [eventPayloadOutputWarning] $
+        renderFromParts eventDoc [payload]
+  where
+    renderedArgs = map (ppSquirrelTerm tc) ts
+    payload = ppSquirrelEventPayload tag renderedArgs
+    eventDoc =
+      text "let "
+        <> text (squirrelEventMacroName tag)
+        <> text " = "
+        <> squirrelDoc payload
+        <> text " in"
+        $$ seqDocs payloadOutput continuationDoc
+    payloadOutput =
+      text (squirrelEventLabelName tag)
+        <> text ": out(pub_chan, "
+        <> text (squirrelEventMacroName tag)
+        <> text ")"
+
 ppSquirrelActionWithInputBinder :: SquirrelContext -> Maybe Doc -> ProcessAnnotation LVar -> LSapicAction -> SquirrelRender
 ppSquirrelActionWithInputBinder tc inputBinder an = \case
   Rep ->
@@ -941,15 +1350,20 @@ ppSquirrelActionWithInputBinder tc inputBinder an = \case
         squirrelWarnings = ["Replication inside process bodies is not supported in Squirrel v1 export; replaced by null."],
         squirrelFunDecls = M.empty,
         squirrelConstDecls = S.singleton "srep_drop",
+        squirrelNameDecls = S.empty,
         squirrelStateDecls = M.empty,
-        squirrelMutexDecls = M.empty
+        squirrelMutexDecls = M.empty,
+        squirrelNeedsWeakSecrecy = False,
+        squirrelGlobalNoParens = False,
+        squirrelSkippedEquations = S.empty,
+        squirrelSkippedLemmas = S.empty
       }
   New v
     | isSyntheticStateChannelVar v -> emptySquirrelRender (text "null")
-    | otherwise -> emptySquirrelRender (text "new " <> ppUnTypeVar v)
+    | otherwise -> emptySquirrelRender (text "new " <> ppUnTypeVar tc v)
   ChIn ch msg mvars ->
     let chRender = ppSquirrelChan an ch
-        binder = fromMaybe (ppSquirrelInputBinder (text "sq_in") msg mvars) inputBinder
+        binder = fromMaybe (ppSquirrelInputBinder tc (text "sq_in") msg mvars) inputBinder
      in chRender
           { squirrelDoc = text "in(" <> squirrelDoc chRender <> text ", " <> binder <> text ")"
           }
@@ -1058,9 +1472,9 @@ ppSquirrelPatternConstraints tc mvars base t =
           _ -> (bound, [], [])
       | otherwise = case viewTerm term of
           Lit (Var v@(SapicLVar lvar _))
-            | v `S.member` mvars -> (bound, [], [emptySquirrelRender (actual <-> text "=" <-> ppLVar lvar)])
-            | v `S.member` bound -> (bound, [], [emptySquirrelRender (actual <-> text "=" <-> ppLVar lvar)])
-            | otherwise -> (S.insert v bound, [(ppLVar lvar, actual)], [])
+            | v `S.member` mvars -> (bound, [], [emptySquirrelRender (actual <-> text "=" <-> ppLVarWith tc lvar)])
+            | v `S.member` bound -> (bound, [], [emptySquirrelRender (actual <-> text "=" <-> ppLVarWith tc lvar)])
+            | otherwise -> (S.insert v bound, [(ppLVarWith tc lvar, actual)], [])
           Lit _ -> (bound, [], [ppSquirrelPatternGuard tc actual term])
           FApp _ _
             | patternVariables term `S.isSubsetOf` (mvars `S.union` bound) ->
@@ -1081,12 +1495,12 @@ wrapWithPatternGuards (condition : rest) body =
   text "if " <> squirrelDoc condition <> text " then"
     $$ wrapBranchDoc (wrapWithPatternGuards rest body)
 
-ppSquirrelInputBinder :: Doc -> SapicTerm -> S.Set SapicLVar -> Doc
-ppSquirrelInputBinder fallback msg mvars =
+ppSquirrelInputBinder :: SquirrelContext -> Doc -> SapicTerm -> S.Set SapicLVar -> Doc
+ppSquirrelInputBinder tc fallback msg mvars =
   case viewTerm msg of
     Lit (Var v@(SapicLVar lvar _))
       | v `S.member` mvars -> fallback
-      | otherwise -> ppLVar lvar
+      | otherwise -> ppLVarWith tc lvar
     _ -> fallback
 
 ppSquirrelInputPatternConstraints ::
@@ -1101,15 +1515,15 @@ ppSquirrelInputPatternConstraints tc binder msg mvars =
       | v `S.notMember` mvars -> ([], [])
     _ -> ppSquirrelPatternConstraints tc mvars binder msg
 
-termVarNames :: SapicTerm -> S.Set String
-termVarNames t =
+termVarNames :: SquirrelContext -> SapicTerm -> S.Set String
+termVarNames tc t =
   case viewTerm t of
-    Lit (Var v) -> S.singleton (ppSapicLVarName v)
+    Lit (Var v) -> S.singleton (ppSapicLVarNameWith tc v)
     Lit _ -> S.empty
-    FApp _ ts -> S.unions (map termVarNames ts)
+    FApp _ ts -> S.unions (map (termVarNames tc) ts)
 
-processVarNames :: LProcess ann -> S.Set String
-processVarNames = S.map ppSapicLVarName . foldMap S.singleton
+processVarNames :: SquirrelContext -> LProcess ann -> S.Set String
+processVarNames tc = S.map (ppSapicLVarNameWith tc) . foldMap S.singleton
 
 freshTempName :: String -> S.Set String -> Doc
 freshTempName base used = text $ head [candidate | i <- [0 :: Int ..], let candidate = suffix i, candidate `S.notMember` used]
@@ -1117,14 +1531,14 @@ freshTempName base used = text $ head [candidate | i <- [0 :: Int ..], let candi
     suffix 0 = base
     suffix i = base ++ "_" ++ show i
 
-freshInputBinder :: SapicTerm -> S.Set SapicLVar -> LProcess ann -> Doc
-freshInputBinder msg mvars continuation =
-  ppSquirrelInputBinder fallback msg mvars
+freshInputBinder :: SquirrelContext -> SapicTerm -> S.Set SapicLVar -> LProcess ann -> Doc
+freshInputBinder tc msg mvars continuation =
+  ppSquirrelInputBinder tc fallback msg mvars
   where
     fallback =
       freshTempName
         "sq_in"
-        (termVarNames msg `S.union` S.map ppSapicLVarName mvars `S.union` processVarNames continuation)
+        (termVarNames tc msg `S.union` S.map (ppSapicLVarNameWith tc) mvars `S.union` processVarNames tc continuation)
 
 updateContextAfterAction :: SquirrelContext -> LSapicAction -> SquirrelContext
 updateContextAfterAction tc (ChIn _ msg mvars) =
@@ -1225,21 +1639,29 @@ ppSquirrelWithDepthHeld ::
   LProcess (ProcessAnnotation LVar) ->
   SquirrelRender
 ppSquirrelWithDepthHeld _ _ _ _ (ProcessNull _) = emptySquirrelRender (text "null")
-ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction (ProcessCall _ _) _ p)
-  | not (isProcessNull p) = ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes p
 ppSquirrelWithDepthHeld _ tc _ _ (ProcessAction (ProcessCall name ts) _ _) =
+  -- The parser keeps an expanded callee body in the continuation for other
+  -- SAPIC backends. Squirrel can call named processes directly, so the export
+  -- must ignore that continuation here to avoid inlining the callee.
   ppSquirrelProcessCall tc name ts
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction Rep _ p) =
-  let idxName = ppSquirrelRepIndex depth (usedRepIndexes `S.union` processVarNames p)
+  let idxName = ppSquirrelRepIndex depth (usedRepIndexes `S.union` processVarNames tc p)
       rp = ppSquirrelWithDepthHeld (depth + 1) tc (S.insert idxName usedRepIndexes) heldMutexes p
       d
         | isProcessNull p || docIsNull (squirrelDoc rp) = text "null"
         | otherwise = repDocs (text idxName) (squirrelDoc rp)
    in rp {squirrelDoc = d}
+ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction a@(Event fact) _ p) =
+  let tcForContinuation = updateContextAfterAction tc a
+      heldForContinuation = updateHeldMutexes tc heldMutexes a
+      rp = ppSquirrelWithDepthHeld depth tcForContinuation usedRepIndexes heldForContinuation p
+      rpDoc = if isProcessNull p then text "null" else squirrelDoc rp
+      eventRender = ppSquirrelEventAction tc fact rpDoc
+   in renderFromParts (squirrelDoc eventRender) [eventRender, rp]
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction a an p) =
   let inputBinder =
         case a of
-          ChIn _ msg mvars -> Just (freshInputBinder msg mvars p)
+          ChIn _ msg mvars -> Just (freshInputBinder tc msg mvars p)
           _ -> Nothing
       ra = ppSquirrelActionWithInputBinder tc inputBinder an a
       tcForContinuation = updateContextAfterAction tc a
@@ -1248,7 +1670,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction a an 
       (rpDoc, patternRenders) =
         case a of
           ChIn _ msg mvars ->
-            let binder = fromMaybe (freshInputBinder msg mvars p) inputBinder
+            let binder = fromMaybe (freshInputBinder tc msg mvars p) inputBinder
                 (projections, guards) = ppSquirrelInputPatternConstraints tc binder msg mvars
                 baseBody = if isProcessNull p then text "null" else squirrelDoc rp
                 checkedBody = wrapWithProjections projections (wrapWithPatternGuards guards baseBody)
@@ -1289,11 +1711,11 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (Let t1
           lhs =
             case viewTerm t1 of
               Lit (Var v@(SapicLVar lvar _))
-                | v `S.notMember` mvars -> ppLVar lvar
+                | v `S.notMember` mvars -> ppLVarWith tc lvar
               _ ->
                 freshTempName
                   "sq_let"
-                  (termVarNames t1 `S.union` termVarNames t2 `S.union` processVarNames pl `S.union` processVarNames pr)
+                  (termVarNames tc t1 `S.union` termVarNames tc t2 `S.union` processVarNames tc pl `S.union` processVarNames tc pr)
           (projections, guards) =
             case viewTerm t1 of
               Lit (Var v)
@@ -1360,7 +1782,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (Lookup
       rr = ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes pr
    in case (squirrelStateRef tc t, ppSquirrelStateAccess tc t) of
         (Just cellRef, Just rs) ->
-          let cVar = ppUnTypeVar c
+          let cVar = ppUnTypeVar tc c
               rp = ppSquirrelStatePresenceAccess tc cellRef
               branches = ppSquirrelBranchRenders tcForThen tc "lookup-then branch" "lookup-else branch" heldMutexes pl rl pr rr
               thenRender = branchThenRender branches
@@ -1528,6 +1950,20 @@ parDocs l r
 emptyTypeEnv :: TypingEnvironment
 emptyTypeEnv = TypingEnvironment {vars = M.empty, events = M.empty, funs = M.empty}
 
+typeVarsEvent :: TypingEnvironment -> FactTag -> [LNTerm] -> M.Map LVar SapicType
+typeVarsEvent te tag ts =
+  case M.lookup tag te.events of
+    Just tys ->
+      foldl'
+        ( \mp (term, ty) ->
+            case viewTerm term of
+              Lit (Var lvar) -> M.insert lvar ty mp
+              _ -> mp
+        )
+        M.empty
+        (zip ts tys)
+    Nothing -> M.empty
+
 mergeType :: Eq a => Maybe a -> Maybe a -> Maybe a
 mergeType t Nothing = t
 mergeType Nothing t = t
@@ -1539,30 +1975,80 @@ mergeEnv = M.mergeWithKey (\_ t1 t2 -> Just $ mergeType t1 t2) id id
 ppSquirrelLNTerm :: SquirrelContext -> S.Set LVar -> LNTerm -> SquirrelRender
 ppSquirrelLNTerm tc boundVars = ppSquirrelFormulaTerm tc boundVars . mapLits (fmap (`SapicLVar` Nothing))
 
-ppSquirrelAtom :: SquirrelContext -> TypingEnvironment -> S.Set LVar -> Bool -> ProtoAtom syn LNTerm -> (SquirrelRender, M.Map LVar SapicType)
-ppSquirrelAtom _ _ _ _ (Action _ (Fact tag _ ts))
+ppReachAtom :: SquirrelFormulaStyle -> Doc -> Doc
+ppReachAtom SquirrelLocalFormula doc = doc
+ppReachAtom SquirrelGlobalFormula doc = brackets doc
+
+ppSquirrelAtom :: SquirrelFormulaStyle -> SquirrelContext -> TypingEnvironment -> S.Set LVar -> Bool -> ProtoAtom syn LNTerm -> (SquirrelRender, M.Map LVar SapicType)
+ppSquirrelAtom style tc te boundVars _ (Action i f@(Fact tag _ ts))
   | factTagArity tag /= length ts = translationFail $ "MALFORMED function" ++ show tag
+  | (tag == KUFact) || isKLogFact f =
+      case ts of
+        [msg] ->
+          let ri = ppSquirrelLNTerm tc boundVars i
+              rm = ppSquirrelLNTerm tc boundVars msg
+              rendered =
+                withGlobalNoParens $
+                  withWeakSecrecy $
+                    renderFromParts
+                      ( text "$("
+                          <> opParens (ppSquirrelMacroAtWithStyle style "frame" (squirrelDoc ri))
+                          <-> text "|>"
+                          <-> opParens (squirrelDoc rm)
+                          <> text ")"
+                      )
+                      [ri, rm]
+           in (rendered, M.empty)
+        _ ->
+          translationFail $
+            "The input file cannot be exported to Squirrel: malformed attacker-knowledge fact in SAPIC formula: "
+              ++ factTagName tag
+  | M.lookup (factTagName tag) (squirrelEventArities tc) == Just (length ts) =
+      let ri = ppSquirrelLNTerm tc boundVars i
+          renderedArgs = map (ppSquirrelLNTerm tc boundVars) ts
+          payload = ppSquirrelEventPayload tag renderedArgs
+          payloadEq =
+            ppSquirrelMacroAtWithStyle style "output" (squirrelDoc ri)
+              <-> opEqual
+              <-> squirrelDoc payload
+          happensDoc = text "happens" <> parens (squirrelDoc ri)
+          execDoc = ppSquirrelMacroAtWithStyle style "exec" (squirrelDoc ri)
+          eventDocs =
+            case style of
+              SquirrelLocalFormula ->
+                sep [opParens happensDoc <-> text "&&", execDoc <-> text "&&", payloadEq]
+              SquirrelGlobalFormula ->
+                sep
+                  [ ppReachAtom style happensDoc <-> text "/\\",
+                    ppReachAtom style execDoc <-> text "/\\",
+                    ppReachAtom style payloadEq
+                  ]
+          rendered =
+            renderFromParts
+              eventDocs
+              [ri, payload]
+       in (rendered, typeVarsEvent te tag ts)
   | otherwise =
       translationFail $
-        "The input file cannot be exported to Squirrel: action facts in SAPIC formulas are not supported: "
+        "The input file cannot be exported to Squirrel: action fact is not emitted by a SAPIC event in the exported process: "
           ++ factTagName tag
-ppSquirrelAtom _ _ _ _ (Syntactic _) =
+ppSquirrelAtom _ _ _ _ _ (Syntactic _) =
   translationFail "The input file cannot be exported to Squirrel: syntactic SAPIC formula atoms are not supported."
-ppSquirrelAtom tc _ boundVars False (EqE l r) =
+ppSquirrelAtom style tc _ boundVars False (EqE l r) =
   let rl = ppSquirrelLNTerm tc boundVars l
       rr = ppSquirrelLNTerm tc boundVars r
-   in (renderFromParts (sep [squirrelDoc rl <-> opEqual, squirrelDoc rr]) [rl, rr], M.empty)
-ppSquirrelAtom tc _ boundVars True (EqE l r) =
+   in (renderFromParts (ppReachAtom style (sep [squirrelDoc rl <-> opEqual, squirrelDoc rr])) [rl, rr], M.empty)
+ppSquirrelAtom style tc _ boundVars True (EqE l r) =
   let rl = ppSquirrelLNTerm tc boundVars l
       rr = ppSquirrelLNTerm tc boundVars r
-   in (renderFromParts (sep [squirrelDoc rl <-> text "<>", squirrelDoc rr]) [rl, rr], M.empty)
-ppSquirrelAtom tc _ boundVars _ (Less u v) =
+   in (renderFromParts (ppReachAtom style (sep [squirrelDoc rl <-> text "<>", squirrelDoc rr])) [rl, rr], M.empty)
+ppSquirrelAtom style tc _ boundVars _ (Less u v) =
   let ru = ppSquirrelLNTerm tc boundVars u
       rv = ppSquirrelLNTerm tc boundVars v
-   in (renderFromParts (squirrelDoc ru <-> opLess <-> squirrelDoc rv) [ru, rv], M.empty)
-ppSquirrelAtom _ _ _ _ (Subterm _ _) =
+   in (renderFromParts (ppReachAtom style (squirrelDoc ru <-> opLess <-> squirrelDoc rv)) [ru, rv], M.empty)
+ppSquirrelAtom _ _ _ _ _ (Subterm _ _) =
   translationFail "The input file cannot be exported to Squirrel: subterm SAPIC formula atoms are not supported."
-ppSquirrelAtom _ _ _ _ (Last i) = (emptySquirrelRender (operator_ "last" <> parens (text (show i))), M.empty)
+ppSquirrelAtom style _ _ _ _ (Last i) = (emptySquirrelRender (ppReachAtom style (operator_ "last" <> parens (text (show i)))), M.empty)
 
 mapLits :: (Ord a, Ord b) => (a -> b) -> Term a -> Term b
 mapLits f t = case viewTerm t of
@@ -1582,47 +2068,268 @@ ppSquirrelLFormula ::
   TypingEnvironment ->
   ProtoFormula syn (String, LSort) Name LVar ->
   m ([LVar], (SquirrelRender, M.Map LVar SapicType))
-ppSquirrelLFormula tc te =
+ppSquirrelLFormula = ppSquirrelLFormulaWithStyle SquirrelLocalFormula
+
+ppSquirrelLFormulaWithStyle ::
+  (MonadFresh m, Functor syn) =>
+  SquirrelFormulaStyle ->
+  SquirrelContext ->
+  TypingEnvironment ->
+  ProtoFormula syn (String, LSort) Name LVar ->
+  m ([LVar], (SquirrelRender, M.Map LVar SapicType))
+ppSquirrelLFormulaWithStyle style tc te =
   pp S.empty
   where
-    pp boundVars (Ato a) = pure ([], ppSquirrelAtom tc te boundVars False (toLAt a))
-    pp _ (TF True) = pure ([], (emptySquirrelRender (operator_ "true"), M.empty))
-    pp _ (TF False) = pure ([], (emptySquirrelRender (operator_ "false"), M.empty))
-    pp boundVars (Not (Ato a@(EqE _ _))) = pure ([], ppSquirrelAtom tc te boundVars True (toLAt a))
+    ppOperand rendered =
+      case style of
+        SquirrelGlobalFormula
+          | squirrelGlobalNoParens rendered -> squirrelDoc rendered
+        _ -> opParens (squirrelDoc rendered)
+
+    pp boundVars (Ato a) = pure ([], ppSquirrelAtom style tc te boundVars False (toLAt a))
+    pp _ (TF True) = pure ([], (emptySquirrelRender (ppReachAtom style (operator_ "true")), M.empty))
+    pp _ (TF False) = pure ([], (emptySquirrelRender (ppReachAtom style (operator_ "false")), M.empty))
+    pp boundVars (Not (Ato a@(EqE _ _))) = pure ([], ppSquirrelAtom style tc te boundVars True (toLAt a))
     pp boundVars (Not p) = do
       (vs, (p', envp)) <- pp boundVars p
-      pure (vs, (renderFromParts (operator_ "not" <> opParens (squirrelDoc p')) [p'], envp))
+      let rendered =
+            case style of
+              SquirrelLocalFormula ->
+                operator_ "not" <> opParens (squirrelDoc p')
+              SquirrelGlobalFormula ->
+                ppOperand p' <-> text "->" <-> ppReachAtom style (operator_ "false")
+      pure (vs, (renderFromParts rendered [p'], envp))
     pp boundVars (Conn op p q) = do
       (vsp, (p', envp)) <- pp boundVars p
       (vsq, (q', envq)) <- pp boundVars q
       let rendered =
             renderFromParts
-              (sep [opParens (squirrelDoc p') <-> ppOp op, opParens (squirrelDoc q')])
+              (ppConn op p' q')
               [p', q']
       pure (vsp ++ vsq, (rendered, mergeEnv envp envq))
       where
-        ppOp And = text "&&"
-        ppOp Or = text "||"
-        ppOp Imp = text "=>"
-        ppOp Iff = opIff
+        ppConn And p' q' =
+          sep [ppOperand p' <-> ppOp And, ppOperand q']
+        ppConn Or p' q' =
+          sep [ppOperand p' <-> ppOp Or, ppOperand q']
+        ppConn Imp p' q' =
+          sep [ppOperand p' <-> ppOp Imp, ppOperand q']
+        ppConn Iff p' q' =
+          case style of
+            SquirrelLocalFormula ->
+              sep [ppOperand p' <-> opIff, ppOperand q']
+            SquirrelGlobalFormula ->
+              sep
+                [ opParens (sep [ppOperand p' <-> text "->", ppOperand q']) <-> text "/\\",
+                  opParens (sep [ppOperand q' <-> text "->", ppOperand p'])
+                ]
+        ppOp And =
+          case style of
+            SquirrelLocalFormula -> text "&&"
+            SquirrelGlobalFormula -> text "/\\"
+        ppOp Or =
+          case style of
+            SquirrelLocalFormula -> text "||"
+            SquirrelGlobalFormula -> text "\\/"
+        ppOp Imp =
+          case style of
+            SquirrelLocalFormula -> text "=>"
+            SquirrelGlobalFormula -> text "->"
     pp boundVars fm@(Qua {}) = scopeFreshness $ do
       (vs, qua, fm') <- openFormulaPrefix fm
       let boundVars' = boundVars `S.union` S.fromList vs
       (vsp, (body, envp)) <- pp boundVars' fm'
       let rendered =
             renderFromParts
-              (ppSquirrelQuant qua <-> ppSquirrelQuantVars vs <> comma <-> squirrelDoc body)
+              (ppSquirrelQuant qua <-> ppSquirrelQuantVars envp vs <> comma <-> squirrelDoc body)
               [body]
       pure (vsp, (rendered, envp))
 
-    ppSquirrelQuant All = text "forall"
-    ppSquirrelQuant Ex = text "exists"
+    ppSquirrelQuant All =
+      case style of
+        SquirrelLocalFormula -> text "forall"
+        SquirrelGlobalFormula -> text "Forall"
+    ppSquirrelQuant Ex =
+      case style of
+        SquirrelLocalFormula -> text "exists"
+        SquirrelGlobalFormula -> text "Exists"
 
-    ppSquirrelQuantVars =
-      parens . fsep . punctuate comma . map ppSquirrelQuantVar
+    ppSquirrelQuantVars envp =
+      parens . fsep . punctuate comma . map (ppSquirrelQuantVar envp)
 
-    ppSquirrelQuantVar v = ppLVar v <> text ":" <> text (ppSquirrelQuantSort (lvarSort v))
+    ppSquirrelQuantVar envp v = ppLVar v <> text ":" <> text (ppSquirrelQuantSort envp v)
 
-    ppSquirrelQuantSort LSortNode = "timestamp"
-    ppSquirrelQuantSort LSortNat = "nat"
-    ppSquirrelQuantSort _ = "message"
+    ppSquirrelQuantSort envp v =
+      let sortName =
+            case lookupQuantType envp v of
+              Just "index" -> "index"
+              Just "node" -> "timestamp"
+              Just "timestamp" -> "timestamp"
+              _ ->
+                case lvarSort v of
+                  LSortNode -> "timestamp"
+                  LSortNat -> "nat"
+                  _ -> "message"
+       in case (style, sortName) of
+            (SquirrelGlobalFormula, "timestamp") -> "timestamp[const]"
+            _ -> sortName
+
+    lookupQuantType envp v =
+      case M.lookup v envp of
+        Just (Just ty) -> Just ty
+        _ ->
+          case M.lookup v te.vars of
+            Just (Just ty) -> Just ty
+            _ -> Nothing
+
+ppSquirrelEquationOrWarning :: SquirrelContext -> Int -> CtxtStRule -> IO SquirrelRender
+ppSquirrelEquationOrWarning tc idx rule = do
+  renderedOrError <- try (evaluate (forceSquirrelRender (ppSquirrelEquationAxiom tc idx rule))) :: IO (Either IOException SquirrelRender)
+  pure $
+    case renderedOrError of
+      Right rendered -> rendered
+      Left err ->
+        withSkippedEquation idx $
+          withWarnings
+            [ "Skipping user-defined equation #"
+                ++ show idx
+                ++ " during Squirrel export: "
+                ++ cleanSquirrelFailure (ioeGetErrorString err)
+            ]
+            (emptySquirrelRender emptyDoc)
+
+ppSquirrelEquationAxiom :: SquirrelContext -> Int -> CtxtStRule -> SquirrelRender
+ppSquirrelEquationAxiom tc idx (CtxtStRule lhs (StRhs _ rhs)) =
+  withWarnings [equationAxiomWarning] $
+    renderFromParts
+      ( text "axiom [any] "
+          <> text ("equation_" ++ show idx)
+          <> ppSquirrelEquationBinders freeVars
+          <> text ": "
+          <> squirrelDoc renderedLhs
+          <-> opEqual
+          <-> squirrelDoc renderedRhs
+          <> text "."
+      )
+      [renderedLhs, renderedRhs]
+  where
+    renderedLhs = ppSquirrelEquationTerm tc lhs
+    renderedRhs = ppSquirrelEquationTerm tc rhs
+    freeVars = S.toList (S.fromList (frees lhs ++ frees rhs))
+
+ppSquirrelEquationBinders :: [LVar] -> Doc
+ppSquirrelEquationBinders [] = emptyDoc
+ppSquirrelEquationBinders vars =
+  text " "
+    <> parens
+      ( fsep
+          ( punctuate
+              comma
+              [ppLVar v <> text ":" <> text (ppSquirrelEquationSort (lvarSort v)) | v <- vars]
+          )
+      )
+
+ppSquirrelEquationSort :: LSort -> String
+ppSquirrelEquationSort LSortNode = "timestamp"
+ppSquirrelEquationSort LSortNat = "nat"
+ppSquirrelEquationSort _ = "message"
+
+equationAxiomWarning :: String
+equationAxiomWarning =
+  "User-defined Tamarin equations are exported as Squirrel axioms; this is a best-effort translation of rewriting semantics."
+
+ppSquirrelLemmaOrWarning :: SquirrelContext -> TypingEnvironment -> ProtoLemma LNFormula ProofSkeleton -> IO SquirrelRender
+ppSquirrelLemmaOrWarning tc te lem = do
+  renderedOrError <- try (evaluate (forceSquirrelRender (ppSquirrelLemma tc te lem))) :: IO (Either IOException SquirrelRender)
+  pure $
+    case renderedOrError of
+      Right rendered -> rendered
+      Left err ->
+        withSkippedLemma lem._lName $
+          withWarnings
+            [ "Skipping selected Tamarin lemma "
+                ++ lem._lName
+                ++ " during Squirrel export: "
+                ++ cleanSquirrelFailure (ioeGetErrorString err)
+            ]
+            (emptySquirrelRender emptyDoc)
+
+forceSquirrelRender :: SquirrelRender -> SquirrelRender
+forceSquirrelRender rendered =
+  forceDoc (squirrelDoc rendered)
+    `seq` forceStrings (squirrelWarnings rendered)
+    `seq` forceStringIntMap (squirrelFunDecls rendered)
+    `seq` forceStrings (S.toList (squirrelConstDecls rendered))
+    `seq` forceStrings (S.toList (squirrelNameDecls rendered))
+    `seq` forceStringIntMap (squirrelStateDecls rendered)
+    `seq` forceStringIntMap (squirrelMutexDecls rendered)
+    `seq` squirrelNeedsWeakSecrecy rendered
+    `seq` squirrelGlobalNoParens rendered
+    `seq` S.foldr seq () (squirrelSkippedEquations rendered)
+    `seq` forceStrings (S.toList (squirrelSkippedLemmas rendered))
+    `seq` rendered
+  where
+    forceDoc = forceString . render
+    forceStrings = foldr (\s acc -> forceString s `seq` acc) ()
+    forceString = foldr seq ()
+    forceStringIntMap =
+      M.foldrWithKey
+        ( \name arity acc ->
+            forceString name `seq` arity `seq` acc
+        )
+        ()
+
+cleanSquirrelFailure :: String -> String
+cleanSquirrelFailure reason =
+  fromMaybe reason $
+    List.stripPrefix "The input file cannot be exported to Squirrel: " normalized
+  where
+    normalized =
+      fromMaybe reason $
+        stripSuffix ")" =<< List.stripPrefix "user error (" reason
+
+stripSuffix :: Eq a => [a] -> [a] -> Maybe [a]
+stripSuffix suffix value =
+  reverse <$> List.stripPrefix (reverse suffix) (reverse value)
+
+ppSquirrelLemma :: SquirrelContext -> TypingEnvironment -> ProtoLemma LNFormula ProofSkeleton -> SquirrelRender
+ppSquirrelLemma tc te lem
+  | LHSLemma `elem` lem._lAttributes || RHSLemma `elem` lem._lAttributes || ReuseDiffLemma `elem` lem._lAttributes =
+      translationFail $
+        "The input file cannot be exported to Squirrel: diff lemmas are not supported: "
+          ++ lem._lName
+  | lem._lTraceQuantifier == ExistsTrace =
+      translationFail $
+        "The input file cannot be exported to Squirrel: exists-trace lemmas are not supported: "
+          ++ lem._lName
+  | otherwise =
+      withWarnings [lemmaAdmitWarning] $
+        renderFromParts
+          (ppLemmaDoc body)
+          [body]
+  where
+    localBody = fst . snd $ Precise.evalFresh (ppSquirrelLFormulaWithStyle SquirrelLocalFormula tc te lem._lFormula) (avoidPrecise lem._lFormula)
+    globalBody = fst . snd $ Precise.evalFresh (ppSquirrelLFormulaWithStyle SquirrelGlobalFormula tc te lem._lFormula) (avoidPrecise lem._lFormula)
+    body
+      | squirrelNeedsWeakSecrecy localBody = globalBody
+      | otherwise = localBody
+    lemmaName = text (sanitizeSquirrelLemmaName lem._lName)
+    ppLemmaDoc renderedBody =
+      lemmaHeader
+        $$ nest 2 (squirrelDoc renderedBody)
+        <> text "."
+        $$ text "Proof."
+        $$ nest 2 (text "admit.")
+        $$ text "Qed."
+    lemmaHeader
+      | squirrelNeedsWeakSecrecy localBody =
+          text "global lemma" <-> lemmaName <-> text "@system:default" <-> text ":"
+      | otherwise =
+          text "lemma" <-> lemmaName <-> text ":"
+
+lemmaAdmitWarning :: String
+lemmaAdmitWarning =
+  "Tamarin lemmas are exported as Squirrel proof obligations with admitted placeholder proofs; they are not automatically re-proved."
+
+sanitizeSquirrelLemmaName :: String -> String
+sanitizeSquirrelLemmaName = sanitizeSquirrelSymbol 'l'
