@@ -3,7 +3,7 @@
 
 {-# HLINT ignore "Use lambda-case" #-}
 
--- Translation from Sapic processes to Squirrel
+-- Export SAPIC processes to Squirrel.
 
 module SquirrelExport
   ( prettySquirrelTheory,
@@ -36,30 +36,49 @@ import Theory.Sapic
 import Theory.Text.Pretty
 
 translationFail :: String -> a
+-- Pure renderers use this so recoverable callers can catch failures after
+-- forcing the rendered output.
 translationFail s = unsafePerformIO (fail s)
 
 data SquirrelContext = SquirrelContext
-  { predicates :: [Predicate],
+  { -- Predicates from the source theory, used when conditions or lemmas need
+    -- expansion before printing.
+    predicates :: [Predicate],
+    -- Builtins enabled by the Tamarin theory.
     squirrelTheoryBuiltins :: S.Set String,
+    -- Event name to payload arity.
     squirrelEventArities :: M.Map String Int,
+    -- Named process definitions and their parameter counts.
     squirrelProcessArities :: M.Map String Int,
+    -- Index-typed variables that have been received or computed as messages.
     messageBoundIndexVars :: S.Set SapicLVar,
+    -- Readable, collision-free names for variables in the current process.
     squirrelVarNames :: M.Map LVar String
   }
 
--- Rendered fragments carry the declarations they require.  The top-level
--- printer merges this metadata after rendering all process bodies.
+-- A rendered fragment plus the declarations and warnings it needs.
 data SquirrelRender = SquirrelRender
-  { squirrelDoc :: Doc,
+  { -- The generated Squirrel syntax for the current fragment.
+    squirrelDoc :: Doc,
+    -- Warnings to print in the generated file.
     squirrelWarnings :: [String],
+    -- Abstract functions needed by rendered terms, with their maximum arity.
     squirrelFunDecls :: M.Map String Int,
+    -- Public constants needed by rendered terms.
     squirrelConstDecls :: S.Set String,
+    -- Fresh names that need Squirrel declarations.
     squirrelNameDecls :: S.Set String,
+    -- Mutable state symbols and their index arities.
     squirrelStateDecls :: M.Map String Int,
+    -- Mutex symbols and their index arities.
     squirrelMutexDecls :: M.Map String Int,
+    -- Whether the output needs WeakSecrecy and global lemma syntax.
     squirrelNeedsWeakSecrecy :: Bool,
+    -- Whether this global formula already has its wrapper.
     squirrelGlobalNoParens :: Bool,
+    -- User equations that were skipped.
     squirrelSkippedEquations :: S.Set Int,
+    -- Selected lemmas that were skipped.
     squirrelSkippedLemmas :: S.Set String
   }
 
@@ -139,15 +158,20 @@ withMutexDecl name arity rendered =
   rendered {squirrelMutexDecls = M.insertWith max name arity (squirrelMutexDecls rendered)}
 
 data SquirrelBuiltinStmt = SquirrelBuiltinStmt
-  { builtinStmtKey :: String,
+  { -- Stable key for deduplicating builtin declarations.
+    builtinStmtKey :: String,
+    -- The Squirrel statement to emit.
     builtinStmtDoc :: Doc
   }
 
--- Squirrel does not match Tamarin's builtin theory exactly.  Best-effort
--- translations are emitted with warnings so callers can inspect the lossiness.
+-- Squirrel and Tamarin builtins do not line up exactly, so lossy translations
+-- carry warnings.
 data BuiltinTranslation = BuiltinTranslation
-  { builtinTranslationStmts :: [SquirrelBuiltinStmt],
+  { -- Squirrel statements needed for this builtin.
+    builtinTranslationStmts :: [SquirrelBuiltinStmt],
+    -- Symbols provided by those statements.
     builtinTranslationNames :: S.Set String,
+    -- Warnings to print near the top of the generated file.
     builtinTranslationWarnings :: [String]
   }
 
@@ -176,9 +200,10 @@ builtinStmt :: String -> Doc -> SquirrelBuiltinStmt
 builtinStmt = SquirrelBuiltinStmt
 
 builtins :: String -> BuiltinTranslation
+-- Map Tamarin builtins to the closest Squirrel declarations.
 builtins "diffie-hellman" =
   bestEffortBuiltin
-    [ builtinStmt "dh-group" (text "ddh g, (^) where group:message exponents:message.")
+    [ builtinStmt "dh-group" (text "gdh g, (^) where group:message exponents:message.")
     ]
     ["g"]
     "Using best-effort translation for diffie-hellman in Squirrel export."
@@ -247,6 +272,7 @@ builtins x =
   unsupportedBuiltin ("unsupported builtin declaration " ++ x ++ ".")
 
 collectBuiltinDecls :: [String] -> ([Doc], S.Set String, [String])
+-- Keep builtin declarations in source order, but emit each statement once.
 collectBuiltinDecls = finalize . foldl' collect (S.empty, [], S.empty, [])
   where
     collect (seenStmtKeys, declsRev, names, warns) builtinName =
@@ -267,6 +293,7 @@ collectBuiltinDecls = finalize . foldl' collect (S.empty, [], S.empty, [])
       )
 
 unsupportedTheoryRules :: OpenTheory -> S.Set CtxtStRule
+-- Only user equations not covered by supported builtins need exporting.
 unsupportedTheoryRules thy =
   stRules thy._thySignature._sigMaudeInfo `S.difference` supportedRules
   where
@@ -276,6 +303,7 @@ unsupportedTheoryRules thy =
         map (maybe S.empty stRules . supportedBuiltinSig) (theoryBuiltins thy)
 
 supportedBuiltinSig :: String -> Maybe MaudeSig
+-- Maude rules already covered by builtin translations.
 supportedBuiltinSig "diffie-hellman" = Just dhMaudeSig
 supportedBuiltinSig "dest-pairing" = Just pairDestMaudeSig
 supportedBuiltinSig "dest-symmetric-encryption" = Just symEncDestMaudeSig
@@ -296,6 +324,12 @@ prettySquirrelTheory ::
   (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
   (OpenTheory, TypingEnvironment) ->
   IO Doc
+-- Entry point for the export frontend:
+--
+--   1. annotate and render processes;
+--   2. render equations and selected lemmas;
+--   3. collect declarations needed by the rendered fragments;
+--   4. assemble the Squirrel file in declaration-before-use order.
 prettySquirrelTheory noReuse lemSel (thy, typEnv) =
   case theoryProcesses thy of
     [] -> pure $ text "(* No SAPIC process found. *)"
@@ -324,8 +358,7 @@ prettySquirrelTheory noReuse lemSel (thy, typEnv) =
       lemmaRendered <- mapM (ppSquirrelLemmaOrWarning tc typEnv) (squirrelLemmas noReuse lemSel thy)
       let
           renderedAll = foldl mergeSquirrelRenders rendered (map snd procDefRendered ++ equationRendered ++ lemmaRendered)
-          -- Declarations are inferred from all rendered processes, then filtered
-          -- against Squirrel/Core names and builtin declarations below.
+          -- Infer declarations from rendered output, then filter builtins.
           (builtinDecls, builtinNames, builtinWarnings) = collectBuiltinDecls (theoryBuiltins thy)
           warningDocs =
             map
@@ -361,9 +394,7 @@ prettySquirrelTheory noReuse lemSel (thy, typEnv) =
               ++ statePresenceDecls
               ++ mutexDecls
           mainProcessDocs =
-            -- The anonymous SAPIC `process:` block is the executable system in
-            -- Squirrel. Named SAPIC process definitions above remain callable
-            -- processes; the top-level process is emitted directly as a system.
+            -- The top-level SAPIC process becomes the executable Squirrel system.
             [ text "",
               text "system" <-> squirrelDoc rendered <> text "."
             ]
@@ -382,6 +413,7 @@ prettySquirrelTheory noReuse lemSel (thy, typEnv) =
         "The input file cannot be exported to Squirrel: multiple SAPIC processes were defined; Squirrel export currently supports exactly one top-level process."
 
 mergeEventArities :: [M.Map String Int] -> M.Map String Int
+-- Event names must have one arity across the theory.
 mergeEventArities =
   M.unionsWith
     ( \l r ->
@@ -391,6 +423,7 @@ mergeEventArities =
     )
 
 collectProcessEvents :: LProcess ann -> M.Map String Int
+-- Record the payload arity of every SAPIC event in a process.
 collectProcessEvents (ProcessNull _) = M.empty
 collectProcessEvents (ProcessAction (Event (Fact tag _ ts)) _ p) =
   M.insertWith
@@ -414,6 +447,7 @@ squirrelLemmas ::
   (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
   OpenTheory ->
   [ProtoLemma LNFormula ProofSkeleton]
+-- Apply the frontend selector and keep lemmas meant for Squirrel.
 squirrelLemmas noReuse lemSel thy = filter isApplicableLemma (theoryLemmas thy)
   where
     isApplicableLemma lem =
@@ -430,6 +464,7 @@ squirrelProcessAritiesFromDefs =
   M.fromList . map (\pdef -> (pdef._pName, length (fromMaybe [] pdef._pVars)))
 
 skippedContentSummaryWarnings :: SquirrelRender -> [String]
+-- Add short summaries before the detailed per-item warnings.
 skippedContentSummaryWarnings rendered =
   [ "Skipped "
       ++ show equationCount
@@ -454,6 +489,7 @@ plural 1 word = word
 plural _ word = word ++ "s"
 
 ppSquirrelProcessDef :: SquirrelContext -> OpenTheory -> ProcessDef -> (Doc, SquirrelRender)
+-- Print a named SAPIC process as a Squirrel `process` declaration.
 ppSquirrelProcessDef tc thy pdef =
   let body = makeAnnotations thy (pdef._pBody)
       vars = fromMaybe [] (pdef._pVars)
@@ -472,6 +508,7 @@ ppSquirrelProcParam :: SquirrelContext -> SapicLVar -> Doc
 ppSquirrelProcParam tc v = ppUnTypeVar tc v <> text ":" <> text (ppSquirrelVarType v)
 
 ppSquirrelProcessCall :: SquirrelContext -> String -> [SapicTerm] -> SquirrelRender
+-- Keep calls to named processes as calls, after checking their arity.
 ppSquirrelProcessCall tc name args =
   case M.lookup name (squirrelProcessArities tc) of
     Nothing ->
@@ -499,11 +536,13 @@ ppSquirrelProcessCall tc name args =
            in renderFromParts (text (sanitizeSquirrelProcessName name) <> callArgs) renderedArgs
 
 ppSquirrelVarType :: SapicLVar -> String
+-- Normalize the few SAPIC type annotations Squirrel needs here.
 ppSquirrelVarType (SapicLVar _ (Just "index")) = "index"
 ppSquirrelVarType (SapicLVar _ (Just "node")) = "timestamp"
 ppSquirrelVarType _ = "message"
 
 squirrelEventSuffixName :: String -> String
+-- Use one sanitized suffix for all generated symbols belonging to an event.
 squirrelEventSuffixName = sanitizeSquirrelSymbol 'e'
 
 squirrelEventSuffix :: FactTag -> String
@@ -532,23 +571,26 @@ ppSquirrelMacroAt :: String -> Doc -> Doc
 ppSquirrelMacroAt name timestamp = text name <> text "@" <> opParens timestamp
 
 ppSquirrelMacroAtWithStyle :: SquirrelFormulaStyle -> String -> Doc -> Doc
+-- Local and global formulas spell timestamped macro access differently.
 ppSquirrelMacroAtWithStyle SquirrelGlobalFormula name timestamp =
   text name <> text "@" <> timestamp
 ppSquirrelMacroAtWithStyle SquirrelLocalFormula name timestamp =
   ppSquirrelMacroAt name timestamp
 
 ppSquirrelEventPayload :: FactTag -> [SquirrelRender] -> SquirrelRender
+-- Build the transparent payload term used by process events and lemmas.
 ppSquirrelEventPayload tag args =
   withFunDecl (squirrelEventPayloadName tag) (length args) $
     renderFromParts
       (ppSquirrelApply (squirrelEventPayloadName tag) (map squirrelDoc args))
       args
 
-eventPayloadOutputWarning :: String
-eventPayloadOutputWarning =
-  "SAPIC events are encoded as public payload outputs in the Squirrel export; event arguments are included in transparent tuple payload terms."
+eventPayloadLetWarning :: String
+eventPayloadLetWarning =
+  "SAPIC events are translated to let-bound payloads in the Squirrel export; no event payload is output on pub_chan."
 
 ppSquirrelLeafProcess :: SquirrelContext -> LProcess (ProcessAnnotation LVar) -> Maybe SquirrelRender
+-- A process definition may be a single `out` without an explicit `null`.
 ppSquirrelLeafProcess tc (ProcessAction (ChOut ch msg) an (ProcessNull _)) =
   let chRender = ppSquirrelChan an ch
       rendered = ppSquirrelTerm tc msg
@@ -559,10 +601,10 @@ ppSquirrelLeafProcess tc (ProcessAction (ChOut ch msg) an (ProcessNull _)) =
 ppSquirrelLeafProcess _ _ = Nothing
 
 makeAnnotations :: OpenTheory -> PlainProcess -> LProcess (ProcessAnnotation LVar)
+-- Normalize a SAPIC process before Squirrel-specific rendering.
 makeAnnotations thy p = res
   where
-    -- Run report rewriting before pure-state annotation so generated state
-    -- channels see the final terms, and preserve secret-channel annotations.
+    -- Keep report rewriting before pure-state annotation; it may change terms.
     p' = report $ annotateSecretChannels $ toAnProcess p
     res = annotatePureStates p'
     report pr =
@@ -571,6 +613,7 @@ makeAnnotations thy p = res
         else translateTermsReport pr
 
 ppSquirrelTypeArrow :: Int -> String -> String
+-- Squirrel uses curried unary functions and tupled domains for larger arities.
 ppSquirrelTypeArrow 0 resultTy = resultTy
 ppSquirrelTypeArrow 1 resultTy = "message -> " ++ resultTy
 ppSquirrelTypeArrow arity resultTy = intercalate " * " (replicate arity "message") ++ " -> " ++ resultTy
@@ -612,6 +655,7 @@ ppSquirrelFunDecl (n, arity) =
     <> text "."
 
 ppSquirrelEventPayloadDecl :: (String, Int) -> Doc
+-- Declare the tagged payload function used for a SAPIC event.
 ppSquirrelEventPayloadDecl (eventName, arity) =
   tagDecl $$ payloadDecl
   where
@@ -649,6 +693,7 @@ ppSquirrelEventPayloadBinder arity =
     <> text ")"
 
 ppSquirrelTransparentEventPayload :: String -> Int -> Doc
+-- Encode event payloads as a tag paired with nested arguments.
 ppSquirrelTransparentEventPayload tagName arity =
   case ppSquirrelEventPayloadVars arity of
     [] -> text tagName
@@ -663,6 +708,7 @@ ppSquirrelNestedPair [x] = x
 ppSquirrelNestedPair (x : xs) = text "<" <> x <> text ", " <> ppSquirrelNestedPair xs <> text ">"
 
 ppSquirrelStateInitDecl :: (String, Int) -> Doc
+-- Give each SAPIC state cell an initial message for its Squirrel mutable.
 ppSquirrelStateInitDecl (n, arity) =
   text "name " <> text (squirrelStateInitName n) <> text " : " <> text (ppSquirrelIndexArrow arity) <> text "."
 
@@ -677,6 +723,7 @@ ppSquirrelStateDecl (n, arity) =
     <> text "."
 
 ppSquirrelStatePresenceDecl :: (String, Int) -> Doc
+-- Track whether a state cell is present, since mutables always have a value.
 ppSquirrelStatePresenceDecl (n, arity) =
   text "mutable "
     <> text (squirrelStatePresentName n)
@@ -708,6 +755,7 @@ ppSquirrelIndexArgs arity =
   parens . fsep . punctuate comma $ [text ("i" ++ show i) | i <- [1 .. arity]]
 
 isSquirrelBuiltinSymbol :: String -> Bool
+-- Names provided by Squirrel or always-included libraries.
 isSquirrelBuiltinSymbol n = n `elem` ["fst", "snd", "diff", "true", "false", "zero", "empty", "witness", "exec", "output", "input", "frame", "att"]
 
 hasAnyBuiltin :: SquirrelContext -> [String] -> Bool
@@ -735,6 +783,7 @@ hasLocationsReportBuiltin :: SquirrelContext -> Bool
 hasLocationsReportBuiltin tc = hasAnyBuiltin tc ["locations-report"]
 
 renderSquirrelFunName :: SquirrelContext -> String -> String
+-- Translate active Tamarin builtin symbols to their Squirrel names.
 renderSquirrelFunName tc n
   | n == "h" && hasHashingBuiltin tc = "hash_fn"
   | n == "senc" && hasSymmetricBuiltin tc = "sym_enc"
@@ -753,6 +802,7 @@ renderSquirrelFunName tc n
   | otherwise = sanitizeSquirrelFunName n
 
 renderSquirrelPkName :: SquirrelContext -> String
+-- Tamarin overloads `pk`; Squirrel needs the signing or encryption version.
 renderSquirrelPkName tc
   | hasSignatureBuiltin tc && hasAsymmetricBuiltin tc =
       translationFail
@@ -762,6 +812,7 @@ renderSquirrelPkName tc
   | otherwise = "asym_pk"
 
 sanitizeSquirrelSymbol :: Char -> String -> String
+-- Convert a source name into a legal Squirrel identifier.
 sanitizeSquirrelSymbol pre s = avoidBlockedName base
   where
     encoded = concatMap encodeSquirrelIdentChar s
@@ -903,6 +954,7 @@ ppSquirrelPubName :: NameId -> String
 ppSquirrelPubName (NameId n) = sanitizeSquirrelSymbol 'a' ("s" ++ n)
 
 ppLVarName :: LVar -> String
+-- Fallback variable rendering outside a process-specific naming context.
 ppLVarName (LVar n _ 0) = sanitizeSquirrelSymbol 'a' n
 ppLVarName (LVar n _ i) = sanitizeSquirrelSymbol 'a' $ n <> "_" <> show i
 
@@ -910,6 +962,7 @@ ppLVar :: LVar -> Doc
 ppLVar = text . ppLVarName
 
 withSquirrelProcessVarNames :: SquirrelContext -> [SapicLVar] -> LProcess ann -> SquirrelContext
+-- Allocate readable, non-conflicting names for variables in this process.
 withSquirrelProcessVarNames tc params process =
   tc
     { squirrelVarNames =
@@ -919,6 +972,7 @@ withSquirrelProcessVarNames tc params process =
     }
 
 processLVars :: [SapicLVar] -> LProcess ann -> S.Set LVar
+-- Gather explicit parameters and variables found in the process tree.
 processLVars params process =
   S.map sapicLVar (S.fromList params `S.union` foldMap S.singleton process)
 
@@ -926,6 +980,7 @@ sapicLVar :: SapicLVar -> LVar
 sapicLVar (SapicLVar lvar _) = lvar
 
 allocateSquirrelVarNames :: S.Set String -> S.Set LVar -> M.Map LVar String
+-- Deterministic allocation keeps generated files stable across runs.
 allocateSquirrelVarNames reservedNames vars = fst (List.foldl' allocate (M.empty, reservedNames) ordered)
   where
     ordered = List.sortOn lvarOrderKey (S.toList vars)
@@ -938,6 +993,7 @@ lvarOrderKey :: LVar -> (String, String, Integer)
 lvarOrderKey lvar = (readableLVarBase lvar, lvarName lvar, lvarIdx lvar)
 
 readableLVarBase :: LVar -> String
+-- Drop numeric location prefixes such as `12_ClientKey` when possible.
 readableLVarBase (LVar name _ _) =
   case stripLocationPrefix name of
     Just readable -> map toLower readable
@@ -951,6 +1007,7 @@ stripLocationPrefix name =
     _ -> Nothing
 
 freshReadableName :: String -> S.Set String -> String
+-- Pick the first unused `base`, `base_1`, ... name.
 freshReadableName base used =
   head
     [ candidate
@@ -976,6 +1033,7 @@ ppUnTypeVar :: SquirrelContext -> SapicLVar -> Doc
 ppUnTypeVar tc (SapicLVar lvar _) = ppLVarWith tc lvar
 
 processReservedNames :: SquirrelContext -> LProcess ann -> S.Set String
+-- Generated names that process variables must not shadow.
 processReservedNames tc = \case
   ProcessNull _ -> S.empty
   ProcessAction action _ continuation ->
@@ -1024,6 +1082,7 @@ combReservedNames tc = \case
   Lookup stateTerm _ -> termDeclNames tc [stateTerm]
 
 termDeclNames :: SquirrelContext -> [SapicTerm] -> S.Set String
+-- Use term-render metadata to find declaration names a term would need.
 termDeclNames tc terms =
   S.unions
     [ M.keysSet (squirrelFunDecls rendered),
@@ -1034,15 +1093,20 @@ termDeclNames tc terms =
     rendered = mergeSquirrelMetadata (map (ppSquirrelTerm tc) terms)
 
 isSyntheticStateChannelVar :: SapicLVar -> Bool
+-- Internal pure-state channels should not appear in Squirrel output.
 isSyntheticStateChannelVar (SapicLVar lvar _) = "StateChannel" `List.isPrefixOf` lvarName lvar
 
 data SquirrelCellRef = SquirrelCellRef
-  { squirrelCellName :: String,
+  { -- Mutable name for the SAPIC state cell.
+    squirrelCellName :: String,
+    -- Index arguments from the cell term.
     squirrelCellArgs :: [SapicTerm]
   }
 
 data SquirrelMutexRef = SquirrelMutexRef
-  { squirrelMutexName :: String,
+  { -- Squirrel mutex name.
+    squirrelMutexName :: String,
+    -- Index arguments from the lock term.
     squirrelMutexArgs :: [SapicTerm]
   }
   deriving (Eq)
@@ -1051,19 +1115,20 @@ ppSquirrelTerm :: SquirrelContext -> SapicTerm -> SquirrelRender
 ppSquirrelTerm tc = ppSquirrelTermWith tc (const True) False
 
 ppSquirrelFormulaTerm :: SquirrelContext -> S.Set LVar -> SapicTerm -> SquirrelRender
+-- In formulas, free public variables are printed as public constants.
 ppSquirrelFormulaTerm tc boundVars = ppSquirrelTermWith tc renderPublicVarAsConstant True
   where
     renderPublicVarAsConstant (SapicLVar lvar _) =
       lvarSort lvar == LSortPub && lvar `S.notMember` boundVars
 
 ppSquirrelEquationTerm :: SquirrelContext -> LNTerm -> SquirrelRender
+-- Equations use plain variables, not formula-style public constants.
 ppSquirrelEquationTerm tc =
   ppSquirrelTermWith tc (const False) False . mapLits (fmap (`SapicLVar` Nothing))
 
--- Formula rendering turns Tamarin's true/false constants into Squirrel bools.
--- Process-term rendering keeps them as ordinary message constants unless a
--- surrounding boolean context explicitly handles them.
+-- Boolean formula contexts print true/false as Squirrel booleans.
 ppSquirrelTermWith :: SquirrelContext -> (SapicLVar -> Bool) -> Bool -> SapicTerm -> SquirrelRender
+-- Render a SAPIC term and collect the declarations it needs.
 ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
   SquirrelRender
     { squirrelDoc = doc,
@@ -1125,8 +1190,7 @@ ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
         let f = sanitizeSquirrelSymbol 'a' ("ac_" ++ show op)
          in goACNested f ts
       FApp (NoEq (f, (_, Private, _))) ts
-        -- locations-report declares rep as a private Tamarin constructor, but
-        -- the Squirrel export models it as an explicit abstract function.
+        -- locations-report exposes `rep` as an abstract Squirrel function.
         | ppFunSym f == "rep" && hasLocationsReportBuiltin tc ->
             ppFunLike "rep" ts
         | otherwise ->
@@ -1173,6 +1237,8 @@ ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
       FApp List ts -> ppFunLike "list" ts
 
     goWithPk pkName tm =
+      -- Rewrite `pk(sk)` when the surrounding builtin tells us which key kind
+      -- Squirrel needs.
       case viewTerm tm of
         FApp (NoEq (f, _)) [skTerm] | ppFunSym f == "pk" ->
           let sk = go skTerm
@@ -1187,6 +1253,7 @@ ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
        in fromPartsWithFun (text f <> text "(" <> fsep (punctuate comma docs) <> text ")") f (length ts) rendered
 
     goACNested _ [] = (text "empty", M.empty, S.singleton "empty", S.empty)
+    -- Encode unknown AC operators as deterministic binary trees.
     goACNested _ [t1] = go t1
     goACNested f [t1, t2] = ppFunLike f [t1, t2]
     goACNested f (t1 : ts) =
@@ -1195,6 +1262,7 @@ ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
        in fromPartsWithFun (text f <> text "(" <> partDoc r1 <> text ", " <> partDoc rest <> text ")") f 2 [r1, rest]
 
     goXor [] = (text "zero", M.empty, S.singleton "zero", S.empty)
+    -- Keep the `xor` dependency even though Squirrel has native XOR syntax.
     goXor [t1] = go t1
     goXor [t1, t2] =
       let r1 = go t1
@@ -1206,6 +1274,7 @@ ppSquirrelTermWith tc renderPublicVarAsConstant renderBoolConstants t =
        in fromPartsWithFun (parens (partDoc r1 <> text " XOR " <> partDoc rest)) "xor" 2 [r1, rest]
 
 ppSquirrelStateAccess :: SquirrelContext -> SapicTerm -> Maybe SquirrelRender
+-- Try to turn a SAPIC state-cell term into a Squirrel mutable access.
 ppSquirrelStateAccess tc t = do
   cell <- squirrelStateRef tc t
   pure $
@@ -1215,6 +1284,7 @@ ppSquirrelStateAccess tc t = do
       (ppSquirrelRefRender tc (squirrelCellName cell) (squirrelCellArgs cell))
 
 ppSquirrelStatePresenceAccess :: SquirrelContext -> SquirrelCellRef -> SquirrelRender
+-- Access the presence flag paired with a state mutable.
 ppSquirrelStatePresenceAccess tc cell =
   withStateDecl
     (squirrelCellName cell)
@@ -1222,6 +1292,7 @@ ppSquirrelStatePresenceAccess tc cell =
     (ppSquirrelRefRender tc (squirrelStatePresentName (squirrelCellName cell)) (squirrelCellArgs cell))
 
 ppSquirrelMutexAccess :: SquirrelContext -> SapicTerm -> Maybe SquirrelRender
+-- Try to turn a SAPIC lock term into a Squirrel mutex access.
 ppSquirrelMutexAccess tc t = do
   mutex <- squirrelMutexRef tc t
   pure $
@@ -1239,8 +1310,7 @@ ppSquirrelRefDoc :: String -> [SquirrelRender] -> Doc
 ppSquirrelRefDoc n [] = text n
 ppSquirrelRefDoc n args = text n <> parens (fsep (punctuate comma (map squirrelDoc args)))
 
--- SAPIC state and mutex cells are encoded as Squirrel indexed symbols.  Only
--- terms with a stable structural shape can become such references.
+-- Only stable, structural terms can become indexed state or mutex references.
 squirrelStateRef :: SquirrelContext -> SapicTerm -> Maybe SquirrelCellRef
 squirrelStateRef tc t = do
   (tag, args) <- squirrelStructuredArgs tc t
@@ -1252,6 +1322,7 @@ squirrelMutexRef tc t = do
   pure $ SquirrelMutexRef ("mtx_" ++ sanitizeSquirrelSymbol 'm' tag) args
 
 squirrelStructuredArgs :: SquirrelContext -> SapicTerm -> Maybe (String, [SapicTerm])
+-- Extract the generated name and index arguments for a state or mutex term.
 squirrelStructuredArgs tc tm =
   case viewTerm tm of
     Lit (Var v@(SapicLVar _ (Just "index")))
@@ -1292,10 +1363,12 @@ squirrelStructuredArgs tc tm =
         pure ("list" ++ concatMap (("_" ++) . fst) parts, concatMap snd parts)
 
 canonicalStructuredParts :: SquirrelContext -> [(String, [SapicTerm])] -> [(String, [SapicTerm])]
+-- Keep AC state-cell names independent of source argument order.
 canonicalStructuredParts tc =
   List.sortBy (compareStructuredParts tc)
 
 canonicalXorStructuredParts :: SquirrelContext -> [(String, [SapicTerm])] -> [(String, [SapicTerm])]
+-- Canonicalize XOR parts with cancellation, matching Tamarin's normal form.
 canonicalXorStructuredParts tc =
   mapMaybe keepOdd
     . List.groupBy samePart
@@ -1315,16 +1388,16 @@ compareStructuredParts :: SquirrelContext -> (String, [SapicTerm]) -> (String, [
 compareStructuredParts tc left right = compare (structuredPartKey tc left) (structuredPartKey tc right)
 
 structuredPartKey :: SquirrelContext -> (String, [SapicTerm]) -> (String, [String])
+-- Rendered argument strings are only used as a stable ordering key.
 structuredPartKey tc (tag, args) = (tag, map (render . squirrelDoc . ppSquirrelTerm tc) args)
 
--- Squirrel has a single public channel in this exporter.  Explicit SAPIC
--- channels are collapsed to it unless the channel was proven always-secret.
 ppSquirrelEventAction :: SquirrelContext -> SapicNFact SapicLVar -> Doc -> SquirrelRender
+-- Represent a SAPIC event as a local payload binding.
 ppSquirrelEventAction tc (Fact tag _ ts) continuationDoc
   | factTagArity tag /= length ts =
       translationFail $ "MALFORMED event fact " ++ show tag
   | otherwise =
-      withWarnings [eventPayloadOutputWarning] $
+      withWarnings [eventPayloadLetWarning] $
         renderFromParts eventDoc [payload]
   where
     renderedArgs = map (ppSquirrelTerm tc) ts
@@ -1335,14 +1408,10 @@ ppSquirrelEventAction tc (Fact tag _ ts) continuationDoc
         <> text " = "
         <> squirrelDoc payload
         <> text " in"
-        $$ seqDocs payloadOutput continuationDoc
-    payloadOutput =
-      text (squirrelEventLabelName tag)
-        <> text ": out(pub_chan, "
-        <> text (squirrelEventMacroName tag)
-        <> text ")"
+        $$ continuationDoc
 
 ppSquirrelActionWithInputBinder :: SquirrelContext -> Maybe Doc -> ProcessAnnotation LVar -> LSapicAction -> SquirrelRender
+-- Render one SAPIC action; sequencing is handled by the recursive renderer.
 ppSquirrelActionWithInputBinder tc inputBinder an = \case
   Rep ->
     SquirrelRender
@@ -1417,10 +1486,12 @@ ppSquirrelActionWithInputBinder tc inputBinder an = \case
         "The input file cannot be exported to Squirrel: unsupported SAPIC action in Squirrel v1 export: " ++ k
 
 mergeSquirrelRenders :: SquirrelRender -> SquirrelRender -> SquirrelRender
+-- Merge metadata while keeping the first document.
 mergeSquirrelRenders l r =
   (mergeSquirrelMetadata [l, r]) {squirrelDoc = squirrelDoc l}
 
 ppSquirrelChan :: ProcessAnnotation LVar -> Maybe SapicTerm -> SquirrelRender
+-- This exporter collapses supported SAPIC channels to one public channel.
 ppSquirrelChan an ch =
   case ch of
     Just _
@@ -1437,6 +1508,7 @@ ppSquirrelChan an ch =
         (emptySquirrelRender (text "pub_chan"))
 
 patternVariables :: SapicTerm -> S.Set SapicLVar
+-- Variables that appear syntactically in a pattern.
 patternVariables t =
   case viewTerm t of
     Lit (Var v) -> S.singleton v
@@ -1444,6 +1516,7 @@ patternVariables t =
     FApp _ ts -> S.unions (map patternVariables ts)
 
 ppSquirrelPatternGuard :: SquirrelContext -> Doc -> SapicTerm -> SquirrelRender
+-- Turn a non-binding pattern fragment into an equality guard.
 ppSquirrelPatternGuard tc actual expected =
   let rendered = ppSquirrelTerm tc expected
    in rendered {squirrelDoc = actual <-> text "=" <-> squirrelDoc rendered}
@@ -1454,13 +1527,16 @@ ppSquirrelPatternConstraints ::
   Doc ->
   SapicTerm ->
   ([(Doc, Doc)], [SquirrelRender])
+-- Convert a SAPIC input or let pattern around an already-bound message:
+--
+-- * nested pairs become `fst`/`snd` projections that bind fresh variables;
+-- * repeated variables and variables from `mvars` become equality guards;
+-- * non-pair patterns may only be checked if all variables are already known.
 ppSquirrelPatternConstraints tc mvars base t =
   let (_, projections, guards) = go S.empty base t
    in (projections, guards)
   where
-    -- Pair patterns become projections; repeated or already-bound variables
-    -- become guards.  Other patterns can only guard over variables already in
-    -- scope, because Squirrel cannot bind inside arbitrary message terms here.
+    -- Squirrel can project pairs, but cannot bind inside arbitrary terms here.
     go bound actual term
       | isPair term = case viewTerm term of
           FApp _ [t1, t2] ->
@@ -1484,18 +1560,21 @@ ppSquirrelPatternConstraints tc mvars base t =
                   "The input file cannot be exported to Squirrel: non-pair patterns with newly bound variables are not supported."
 
 wrapWithProjections :: [(Doc, Doc)] -> Doc -> Doc
+-- Wrap a body in projection lets.
 wrapWithProjections [] body = body
 wrapWithProjections ((var, proj) : rest) body =
   text "let " <> var <> text " = " <> proj <> text " in"
     $$ wrapWithProjections rest body
 
 wrapWithPatternGuards :: [SquirrelRender] -> Doc -> Doc
+-- Wrap a branch in pattern equality guards.
 wrapWithPatternGuards [] body = body
 wrapWithPatternGuards (condition : rest) body =
   text "if " <> squirrelDoc condition <> text " then"
     $$ wrapBranchDoc (wrapWithPatternGuards rest body)
 
 ppSquirrelInputBinder :: SquirrelContext -> Doc -> SapicTerm -> S.Set SapicLVar -> Doc
+-- Bind simple input variables directly; use a temporary for patterns.
 ppSquirrelInputBinder tc fallback msg mvars =
   case viewTerm msg of
     Lit (Var v@(SapicLVar lvar _))
@@ -1532,6 +1611,7 @@ freshTempName base used = text $ head [candidate | i <- [0 :: Int ..], let candi
     suffix i = base ++ "_" ++ show i
 
 freshInputBinder :: SquirrelContext -> SapicTerm -> S.Set SapicLVar -> LProcess ann -> Doc
+-- Pick a temporary input name that cannot collide with nearby variables.
 freshInputBinder tc msg mvars continuation =
   ppSquirrelInputBinder tc fallback msg mvars
   where
@@ -1541,6 +1621,7 @@ freshInputBinder tc msg mvars continuation =
         (termVarNames tc msg `S.union` S.map (ppSapicLVarNameWith tc) mvars `S.union` processVarNames tc continuation)
 
 updateContextAfterAction :: SquirrelContext -> LSapicAction -> SquirrelContext
+-- Track index-typed variables that were obtained as messages.
 updateContextAfterAction tc (ChIn _ msg mvars) =
   tc
     { messageBoundIndexVars =
@@ -1556,6 +1637,7 @@ updateContextAfterLet tc patternTerm mvars =
     }
 
 updateContextAfterLookup :: SquirrelContext -> SapicLVar -> SquirrelContext
+-- A lookup result is a message, even if the target variable is typed as index.
 updateContextAfterLookup tc v@(SapicLVar _ (Just "index")) =
   tc {messageBoundIndexVars = S.insert v (messageBoundIndexVars tc)}
 updateContextAfterLookup tc _ = tc
@@ -1563,8 +1645,7 @@ updateContextAfterLookup tc _ = tc
 inputBoundIndexVars :: SapicTerm -> S.Set SapicLVar -> S.Set SapicLVar
 inputBoundIndexVars msg mvars = indexVarsInTerm msg `S.difference` mvars
 
--- Index variables received as messages are no longer safe to use as Squirrel
--- state indices.  Track them so later state/mutex references are rejected.
+-- Index variables received as messages cannot be used as Squirrel indices.
 indexVarsInTerm :: SapicTerm -> S.Set SapicLVar
 indexVarsInTerm tm =
   case viewTerm tm of
@@ -1573,6 +1654,7 @@ indexVarsInTerm tm =
     FApp _ ts -> S.unions (map indexVarsInTerm ts)
 
 ppSquirrel :: SquirrelContext -> LProcess (ProcessAnnotation LVar) -> SquirrelRender
+-- Render a complete process and reject paths that exit while holding a mutex.
 ppSquirrel tc p =
   let rendered = ppSquirrelWithDepth 0 tc p
       heldAfter = heldDefinitelyAfterProcess tc [] p
@@ -1583,12 +1665,17 @@ ppSquirrel tc p =
             "The input file cannot be exported to Squirrel: process terminates while holding a lock."
 
 ppSquirrelWithDepth :: Int -> SquirrelContext -> LProcess (ProcessAnnotation LVar) -> SquirrelRender
+-- Start recursive process rendering with no held mutexes.
 ppSquirrelWithDepth depth tc = ppSquirrelWithDepthHeld depth tc S.empty []
 
 data BranchRenders = BranchRenders
-  { branchThenRender :: SquirrelRender,
+  { -- Rendered then/left branch.
+    branchThenRender :: SquirrelRender,
+    -- Rendered else/right branch.
     branchElseRender :: SquirrelRender,
+    -- Whether to print the else/right branch.
     branchHasElse :: Bool,
+    -- Warnings from branch handling.
     branchWarnings :: [String]
   }
 
@@ -1603,9 +1690,9 @@ ppSquirrelBranchRenders ::
   LProcess (ProcessAnnotation LVar) ->
   SquirrelRender ->
   BranchRenders
+-- Shared branch checks for conditionals and lookups.
 ppSquirrelBranchRenders thenTc elseTc thenName elseName heldMutexes pl rl pr rr =
-  -- Squirrel mutex state cannot be path-dependent: both branches must leave
-  -- exactly the locks they inherited.
+  -- Both branches must return with the same locks they started with.
   if heldAfterThen /= heldMutexes || heldAfterElse /= heldMutexes
     then
       translationFail $
@@ -1638,13 +1725,16 @@ ppSquirrelWithDepthHeld ::
   [SquirrelMutexRef] ->
   LProcess (ProcessAnnotation LVar) ->
   SquirrelRender
+-- Recursive process renderer.  It also threads:
+--
+-- * names reserved for replication indices;
+-- * currently held mutexes.
 ppSquirrelWithDepthHeld _ _ _ _ (ProcessNull _) = emptySquirrelRender (text "null")
 ppSquirrelWithDepthHeld _ tc _ _ (ProcessAction (ProcessCall name ts) _ _) =
-  -- The parser keeps an expanded callee body in the continuation for other
-  -- SAPIC backends. Squirrel can call named processes directly, so the export
-  -- must ignore that continuation here to avoid inlining the callee.
+  -- Ignore the parser's expanded continuation; Squirrel can call the process.
   ppSquirrelProcessCall tc name ts
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction Rep _ p) =
+  -- Tamarin replication becomes Squirrel indexed replication.
   let idxName = ppSquirrelRepIndex depth (usedRepIndexes `S.union` processVarNames tc p)
       rp = ppSquirrelWithDepthHeld (depth + 1) tc (S.insert idxName usedRepIndexes) heldMutexes p
       d
@@ -1652,6 +1742,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction Rep _
         | otherwise = repDocs (text idxName) (squirrelDoc rp)
    in rp {squirrelDoc = d}
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction a@(Event fact) _ p) =
+  -- Events wrap the continuation as local payload lets.
   let tcForContinuation = updateContextAfterAction tc a
       heldForContinuation = updateHeldMutexes tc heldMutexes a
       rp = ppSquirrelWithDepthHeld depth tcForContinuation usedRepIndexes heldForContinuation p
@@ -1659,6 +1750,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction a@(Ev
       eventRender = ppSquirrelEventAction tc fact rpDoc
    in renderFromParts (squirrelDoc eventRender) [eventRender, rp]
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction a an p) =
+  -- Inputs may need a temporary binder plus pattern projections and guards.
   let inputBinder =
         case a of
           ChIn _ msg mvars -> Just (freshInputBinder tc msg mvars p)
@@ -1683,6 +1775,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessAction a an 
         _ -> seqDocs (squirrelDoc ra) rpDoc
    in renderFromParts d (ra : rp : patternRenders)
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb Parallel _ pl pr) =
+  -- Parallel branches must end with the same locks they inherited.
   let rl = ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes pl
       rr = ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes pr
       heldAfterLeft = heldDefinitelyAfterProcess tc heldMutexes pl
@@ -1699,6 +1792,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb Paralle
 ppSquirrelWithDepthHeld _ _ _ _ (ProcessComb NDC _ _ _) =
   translationFail "The input file cannot be exported to Squirrel: non-deterministic choice is not supported in Squirrel process bodies."
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (Let t1 t2 mvars) _ pl pr) =
+  -- Squirrel has no direct `let pattern = term else branch` construct.
   if not (isProcessNull pr)
     then
       translationFail
@@ -1734,6 +1828,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (Let t1
                       $$ wrappedThen
        in renderFromParts d (rt2 : rl : rr : guards)
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (Cond c) _ pl pr) =
+  -- Expand predicate-based SAPIC conditions before rendering the guard.
   let rl = ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes pl
       rr = ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes pr
       branches = ppSquirrelBranchRenders tc tc "then-branch" "else-branch" heldMutexes pl rl pr rr
@@ -1757,6 +1852,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (Cond c
         (branchWarnings branches)
         (renderFromParts d [condRender, thenRender, rr, elseRender])
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (CondEq t1 t2) _ pl pr) =
+  -- Some Tamarin boolean checks appear as message-term equalities.
   let rl = ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes pl
       rr = ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes pr
       branches = ppSquirrelBranchRenders tc tc "then-branch" "else-branch" heldMutexes pl rl pr rr
@@ -1777,6 +1873,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (CondEq
         (renderFromParts d (thenRender : rr : elseRender : condRenders))
 
 ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (Lookup t c) _ pl pr) =
+  -- Lookups read the value mutable and check the companion presence flag.
   let tcForThen = updateContextAfterLookup tc c
       rl = ppSquirrelWithDepthHeld depth tcForThen usedRepIndexes heldMutexes pl
       rr = ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes pr
@@ -1806,6 +1903,7 @@ ppSquirrelWithDepthHeld depth tc usedRepIndexes heldMutexes (ProcessComb (Lookup
           translationFail
             "The input file cannot be exported to Squirrel: lookup on non-indexed state cells is not supported."
 updateHeldMutexes :: SquirrelContext -> [SquirrelMutexRef] -> LSapicAction -> [SquirrelMutexRef]
+-- Track lock ownership through straight-line actions.
 updateHeldMutexes tc held = \case
   Lock t ->
     case squirrelMutexRef tc t of
@@ -1818,19 +1916,20 @@ updateHeldMutexes tc held = \case
   _ -> held
 
 addHeldMutex :: [SquirrelMutexRef] -> SquirrelMutexRef -> [SquirrelMutexRef]
+-- Reject double-locking on one path.
 addHeldMutex held mtx
   | mtx `elem` held =
       translationFail "The input file cannot be exported to Squirrel: process locks a mutex that is already held."
   | otherwise = mtx : held
 
 removeHeldMutex :: [SquirrelMutexRef] -> SquirrelMutexRef -> [SquirrelMutexRef]
+-- Reject unlocking a mutex that is not definitely held.
 removeHeldMutex held mtx
   | mtx `elem` held = filter (/= mtx) held
   | otherwise =
       translationFail "The input file cannot be exported to Squirrel: process unlocks a mutex that is not held."
 
--- Conservative lock-flow analysis used to reject processes whose Squirrel
--- translation would make lock ownership branch-dependent or leak to exit.
+-- Conservative lock-flow analysis for branches and process exit.
 heldDefinitelyAfterProcess :: SquirrelContext -> [SquirrelMutexRef] -> LProcess (ProcessAnnotation LVar) -> [SquirrelMutexRef]
 heldDefinitelyAfterProcess _ held (ProcessNull _) = held
 heldDefinitelyAfterProcess tc held (ProcessAction (ProcessCall _ _) _ p)
@@ -1862,9 +1961,7 @@ heldDefinitelyAfterProcess tc held (ProcessComb (Lookup _ c) _ pl pr) =
   heldDefinitelyAfterProcess (updateContextAfterLookup tc c) held pl
     `List.intersect` heldDefinitelyAfterProcess tc held pr
 
--- CondEq is overloaded in SAPIC: equality over messages, but often boolean
--- tests after builtin verification.  Render boolean cases as Squirrel boolean
--- conditions, while keeping message equality for ordinary terms.
+-- Render boolean-looking CondEq terms as boolean conditions.
 ppSquirrelCondEq :: SquirrelContext -> SapicTerm -> SquirrelRender -> SapicTerm -> SquirrelRender -> (Doc, [SquirrelRender])
 ppSquirrelCondEq tc t1 r1 t2 r2
   | Just b1 <- boolLiteralValue t1,
@@ -1915,6 +2012,7 @@ isProcessNull (ProcessNull _) = True
 isProcessNull _ = False
 
 docIsNull :: Doc -> Bool
+-- Treat rendered `null` as an empty process fragment.
 docIsNull d = all isSpace stripped || stripped == "null"
   where
     stripped = dropWhile isSpace (render d)
@@ -1929,6 +2027,7 @@ wrapBranchDoc :: Doc -> Doc
 wrapBranchDoc d = text "(" $$ nest 2 d $$ text ")"
 
 ppSquirrelRepIndex :: Int -> S.Set String -> String
+-- Choose compact index names for nested replications.
 ppSquirrelRepIndex depth used = name
   where
     names = ["i", "j", "k", "l", "m", "n", "r", "s", "t"]
@@ -1948,9 +2047,11 @@ parDocs l r
   | otherwise = parens $ nest 2 l $$ text "|" <-> r
 
 emptyTypeEnv :: TypingEnvironment
+-- Process guards do not come with a lemma typing environment.
 emptyTypeEnv = TypingEnvironment {vars = M.empty, events = M.empty, funs = M.empty}
 
 typeVarsEvent :: TypingEnvironment -> FactTag -> [LNTerm] -> M.Map LVar SapicType
+-- Recover variable types from event arguments when available.
 typeVarsEvent te tag ts =
   case M.lookup tag te.events of
     Just tys ->
@@ -1965,6 +2066,7 @@ typeVarsEvent te tag ts =
     Nothing -> M.empty
 
 mergeType :: Eq a => Maybe a -> Maybe a -> Maybe a
+-- Keep the newer type when two paths provide one.
 mergeType t Nothing = t
 mergeType Nothing t = t
 mergeType _ t = t
@@ -1973,13 +2075,16 @@ mergeEnv :: M.Map LVar SapicType -> M.Map LVar SapicType -> M.Map LVar SapicType
 mergeEnv = M.mergeWithKey (\_ t1 t2 -> Just $ mergeType t1 t2) id id
 
 ppSquirrelLNTerm :: SquirrelContext -> S.Set LVar -> LNTerm -> SquirrelRender
+-- Reuse the SAPIC term renderer for formula terms.
 ppSquirrelLNTerm tc boundVars = ppSquirrelFormulaTerm tc boundVars . mapLits (fmap (`SapicLVar` Nothing))
 
 ppReachAtom :: SquirrelFormulaStyle -> Doc -> Doc
+-- Global lemmas wrap reachability atoms; local formulas do not.
 ppReachAtom SquirrelLocalFormula doc = doc
 ppReachAtom SquirrelGlobalFormula doc = brackets doc
 
 ppSquirrelAtom :: SquirrelFormulaStyle -> SquirrelContext -> TypingEnvironment -> S.Set LVar -> Bool -> ProtoAtom syn LNTerm -> (SquirrelRender, M.Map LVar SapicType)
+-- Render one Tamarin formula atom.
 ppSquirrelAtom style tc te boundVars _ (Action i f@(Fact tag _ ts))
   | factTagArity tag /= length ts = translationFail $ "MALFORMED function" ++ show tag
   | (tag == KUFact) || isKLogFact f =
@@ -2008,7 +2113,7 @@ ppSquirrelAtom style tc te boundVars _ (Action i f@(Fact tag _ ts))
           renderedArgs = map (ppSquirrelLNTerm tc boundVars) ts
           payload = ppSquirrelEventPayload tag renderedArgs
           payloadEq =
-            ppSquirrelMacroAtWithStyle style "output" (squirrelDoc ri)
+            ppSquirrelMacroAtWithStyle style (squirrelEventMacroName tag) (squirrelDoc ri)
               <-> opEqual
               <-> squirrelDoc payload
           happensDoc = text "happens" <> parens (squirrelDoc ri)
@@ -2051,15 +2156,18 @@ ppSquirrelAtom _ _ _ _ _ (Subterm _ _) =
 ppSquirrelAtom style _ _ _ _ (Last i) = (emptySquirrelRender (ppReachAtom style (operator_ "last" <> parens (text (show i)))), M.empty)
 
 mapLits :: (Ord a, Ord b) => (a -> b) -> Term a -> Term b
+-- Local literal mapper for the term shapes used here.
 mapLits f t = case viewTerm t of
   Lit l -> lit . f $ l
   FApp o as -> fApp o (map (mapLits f) as)
 
 extractFree :: BVar p -> p
+-- After opening a formula, only free variables should remain.
 extractFree (Free v) = v
 extractFree (Bound i) = translationFail $ "prettyFormula: illegal bound variable '" ++ show i ++ "'"
 
 toLAt :: (Ord (f1 b), Ord (f1 (BVar b)), Functor f2, Functor f1) => f2 (Term (f1 (BVar b))) -> f2 (Term (f1 b))
+-- Convert an opened atom back to free-variable form.
 toLAt = fmap (mapLits (fmap extractFree))
 
 ppSquirrelLFormula ::
@@ -2068,6 +2176,7 @@ ppSquirrelLFormula ::
   TypingEnvironment ->
   ProtoFormula syn (String, LSort) Name LVar ->
   m ([LVar], (SquirrelRender, M.Map LVar SapicType))
+-- Default formula printer for local Squirrel syntax.
 ppSquirrelLFormula = ppSquirrelLFormulaWithStyle SquirrelLocalFormula
 
 ppSquirrelLFormulaWithStyle ::
@@ -2077,10 +2186,12 @@ ppSquirrelLFormulaWithStyle ::
   TypingEnvironment ->
   ProtoFormula syn (String, LSort) Name LVar ->
   m ([LVar], (SquirrelRender, M.Map LVar SapicType))
+-- Render a Tamarin formula and infer any types carried by event atoms.
 ppSquirrelLFormulaWithStyle style tc te =
   pp S.empty
   where
     ppOperand rendered =
+      -- Some global atoms, such as WeakSecrecy expressions, are already complete.
       case style of
         SquirrelGlobalFormula
           | squirrelGlobalNoParens rendered -> squirrelDoc rendered
@@ -2136,6 +2247,7 @@ ppSquirrelLFormulaWithStyle style tc te =
             SquirrelLocalFormula -> text "=>"
             SquirrelGlobalFormula -> text "->"
     pp boundVars fm@(Qua {}) = scopeFreshness $ do
+      -- Open consecutive quantifiers together for a compact binder list.
       (vs, qua, fm') <- openFormulaPrefix fm
       let boundVars' = boundVars `S.union` S.fromList vs
       (vsp, (body, envp)) <- pp boundVars' fm'
@@ -2160,6 +2272,7 @@ ppSquirrelLFormulaWithStyle style tc te =
     ppSquirrelQuantVar envp v = ppLVar v <> text ":" <> text (ppSquirrelQuantSort envp v)
 
     ppSquirrelQuantSort envp v =
+      -- Prefer types from events, then the typing environment, then the raw sort.
       let sortName =
             case lookupQuantType envp v of
               Just "index" -> "index"
@@ -2183,6 +2296,7 @@ ppSquirrelLFormulaWithStyle style tc te =
             _ -> Nothing
 
 ppSquirrelEquationOrWarning :: SquirrelContext -> Int -> CtxtStRule -> IO SquirrelRender
+-- Unsupported user equations become warnings instead of aborting the export.
 ppSquirrelEquationOrWarning tc idx rule = do
   renderedOrError <- try (evaluate (forceSquirrelRender (ppSquirrelEquationAxiom tc idx rule))) :: IO (Either IOException SquirrelRender)
   pure $
@@ -2199,6 +2313,7 @@ ppSquirrelEquationOrWarning tc idx rule = do
             (emptySquirrelRender emptyDoc)
 
 ppSquirrelEquationAxiom :: SquirrelContext -> Int -> CtxtStRule -> SquirrelRender
+-- Export a Tamarin rewrite rule as a best-effort Squirrel axiom.
 ppSquirrelEquationAxiom tc idx (CtxtStRule lhs (StRhs _ rhs)) =
   withWarnings [equationAxiomWarning] $
     renderFromParts
@@ -2218,6 +2333,7 @@ ppSquirrelEquationAxiom tc idx (CtxtStRule lhs (StRhs _ rhs)) =
     freeVars = S.toList (S.fromList (frees lhs ++ frees rhs))
 
 ppSquirrelEquationBinders :: [LVar] -> Doc
+-- Quantify the free variables used by the exported equation.
 ppSquirrelEquationBinders [] = emptyDoc
 ppSquirrelEquationBinders vars =
   text " "
@@ -2239,6 +2355,7 @@ equationAxiomWarning =
   "User-defined Tamarin equations are exported as Squirrel axioms; this is a best-effort translation of rewriting semantics."
 
 ppSquirrelLemmaOrWarning :: SquirrelContext -> TypingEnvironment -> ProtoLemma LNFormula ProofSkeleton -> IO SquirrelRender
+-- Unsupported selected lemmas become warnings.
 ppSquirrelLemmaOrWarning tc te lem = do
   renderedOrError <- try (evaluate (forceSquirrelRender (ppSquirrelLemma tc te lem))) :: IO (Either IOException SquirrelRender)
   pure $
@@ -2255,6 +2372,7 @@ ppSquirrelLemmaOrWarning tc te lem = do
             (emptySquirrelRender emptyDoc)
 
 forceSquirrelRender :: SquirrelRender -> SquirrelRender
+-- Force lazy render fields so recoverable failures are caught in IO.
 forceSquirrelRender rendered =
   forceDoc (squirrelDoc rendered)
     `seq` forceStrings (squirrelWarnings rendered)
@@ -2280,6 +2398,7 @@ forceSquirrelRender rendered =
         ()
 
 cleanSquirrelFailure :: String -> String
+-- Remove IO exception boilerplate from generated warnings.
 cleanSquirrelFailure reason =
   fromMaybe reason $
     List.stripPrefix "The input file cannot be exported to Squirrel: " normalized
@@ -2293,6 +2412,7 @@ stripSuffix suffix value =
   reverse <$> List.stripPrefix (reverse suffix) (reverse value)
 
 ppSquirrelLemma :: SquirrelContext -> TypingEnvironment -> ProtoLemma LNFormula ProofSkeleton -> SquirrelRender
+-- Convert a supported Tamarin lemma into a Squirrel lemma skeleton.
 ppSquirrelLemma tc te lem
   | LHSLemma `elem` lem._lAttributes || RHSLemma `elem` lem._lAttributes || ReuseDiffLemma `elem` lem._lAttributes =
       translationFail $
